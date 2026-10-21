@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod decoder;
+#[cfg(not(target_os = "android"))]
 pub mod gamepad;
 pub mod record;
 pub mod viewer;

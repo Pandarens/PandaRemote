@@ -1,21 +1,9 @@
 // Hide the console window for the GUI build in release.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod autostart;
-mod client;
-mod config;
-mod gui;
-mod host;
-mod icons;
-mod media;
-mod proto;
 #[cfg(windows)]
-mod service;
-mod ticket;
-#[cfg(windows)]
-mod tray;
-mod update;
-mod yuv_render;
+use panda_rc::service;
+use panda_rc::{client, config, gui, host, media, proto, ticket, update};
 
 use std::sync::Arc;
 

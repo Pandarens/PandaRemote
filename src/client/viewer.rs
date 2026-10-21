@@ -48,7 +48,7 @@ pub struct Shared {
     /// The host is on its lock screen / a UAC prompt.
     pub secure_desktop: AtomicBool,
     /// Where host vibration requests go (set by the GUI in the game profile).
-    pub rumble: Mutex<Option<super::gamepad::RumbleSender>>,
+    pub rumble: Mutex<Option<std::sync::mpsc::Sender<(u8, u8)>>>,
     /// View only: input and gamepad are not sent (releases still are, so nothing stays held down).
     pub view_only: AtomicBool,
     /// The host's monitors and the index of the streamed one.
