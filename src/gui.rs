@@ -19,10 +19,10 @@ use crate::{
     autostart,
     client::{self, gamepad, viewer},
     config::{self, HostConfig, JournalEntry, SavedHost},
-    host::Host,
+    host::{self, Host},
     icons::{self, Icon},
     media::annotate::{self, DrawEvent, Ink},
-    proto::{ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, Profile},
+    proto::{self, ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, Profile},
     ticket::Ticket,
     update::{self, Version},
     yuv_render::{self, PendingFrame},
@@ -41,7 +41,28 @@ pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>, minimized: bool) -> 
         options,
         Box::new(move |cc| {
             let gpu_video = yuv_render::init(cc.wgpu_render_state.as_ref());
-            Ok(Box::new(App::new(cc.egui_ctx.clone(), rt, initial, gpu_video, minimized)))
+            let mut app = App::new(cc.egui_ctx.clone(), rt, initial, gpu_video, minimized);
+            #[cfg(windows)]
+            {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
+                    Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get()),
+                    _ => None,
+                };
+                app.tray = hwnd.and_then(|hwnd| {
+                    crate::tray::Tray::new(hwnd, cc.egui_ctx.clone())
+                        .map_err(|e| tracing::warn!("no tray icon: {e:#}"))
+                        .ok()
+                });
+                // Autostart: live in the tray; without a tray icon, fall back to a minimized window.
+                if minimized {
+                    match &app.tray {
+                        Some(t) => t.hide_window(),
+                        None => cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    }
+                }
+            }
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
@@ -58,6 +79,20 @@ enum UiEvent {
     ServiceDone(ServiceOp, Result<(), String>),
     /// The host wants a PIN: none was given, or it refused the one given (the reason).
     PinNeeded(Option<String>),
+    /// A Wake-on-LAN request finished.
+    Woke {
+        target: String,
+        via: String,
+        ticket: String,
+        macs: Vec<[u8; 6]>,
+        result: Result<(), WakeError>,
+    },
+}
+
+enum WakeError {
+    /// The relaying PC wants its PIN (reason when one was given and refused).
+    Pin(Option<String>),
+    Other(String),
 }
 
 /// What runs with administrator rights (UAC prompt) through `panda-rc service …`.
@@ -69,6 +104,8 @@ enum ServiceOp {
     SyncTicket,
     /// Set (true) or remove (false) the service's PIN.
     SetPin(bool),
+    /// Create the service's view-only ticket (then copy it).
+    ViewTicket,
 }
 
 /// The PIN dialog shown when a host asks for one; connecting again sends it.
@@ -79,6 +116,14 @@ struct PinPrompt {
     monitor: Option<u8>,
     pin: String,
     error: Option<String>,
+    purpose: PinPurpose,
+}
+
+/// What the PIN is for: opening a session, or asking that PC to wake another one.
+#[derive(Clone)]
+enum PinPurpose {
+    Session,
+    Wake { target: String, macs: Vec<[u8; 6]> },
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -116,6 +161,8 @@ struct App {
     update: Arc<Mutex<UpdateState>>,
     /// Wakes the update checker early ("check now").
     update_now: Arc<tokio::sync::Notify>,
+    #[cfg(windows)]
+    tray: Option<crate::tray::Tray>,
     /// Our executable's modification time at start: when the service replaces it, we restart too.
     exe_mtime: Option<std::time::SystemTime>,
     exe_checked: Instant,
@@ -187,6 +234,19 @@ struct DesktopView {
     stroke_seq: u32,
     /// Stroke being drawn while the button is held.
     drawing: Option<u32>,
+    /// Files to send (dropped on the window or picked in a dialog).
+    files: tmpsc::UnboundedSender<std::path::PathBuf>,
+    /// Shared clipboard: on, the local clipboard handle and the last text that crossed the link.
+    clipboard_sync: bool,
+    clipboard: Option<arboard::Clipboard>,
+    last_clip: Option<String>,
+    clip_checked: Instant,
+    /// The note being typed for the remote screen.
+    note_edit: Option<String>,
+    /// When the current recording started.
+    recording: Option<Instant>,
+    /// The host's network addresses were saved with the computer.
+    macs_saved: bool,
 }
 
 /// Game-profile input: captured pointer, raw mouse deltas, keys as scancodes, gamepad forwarding.
@@ -259,9 +319,13 @@ impl App {
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         apply_style(&ctx);
+        // On Windows the tray decides (see `run`).
+        #[cfg(not(windows))]
         if minimized {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
+        #[cfg(windows)]
+        let _ = minimized;
         let settings = config::load_settings();
         if settings.autostart {
             // Re-register on every start: keeps the entry pointing at the current program location.
@@ -299,6 +363,8 @@ impl App {
             ping_targets: Arc::default(),
             update: Arc::new(Mutex::new(UpdateState::Checking)),
             update_now: Arc::default(),
+            #[cfg(windows)]
+            tray: None,
             exe_mtime: exe_mtime(),
             exe_checked: Instant::now(),
         };
@@ -430,16 +496,58 @@ impl App {
                             (false, "PIN-код задан: без него к этому ПК не войти.".into())
                         }
                         (ServiceOp::SetPin(false), Ok(())) => (false, "PIN-код убран.".into()),
+                        (ServiceOp::ViewTicket, Ok(())) => match view_ticket() {
+                            Some(t) => {
+                                self.ctx.copy_text(t);
+                                (
+                                    false,
+                                    "Билет для просмотра скопирован: по нему видно экран, но управлять нельзя.".into(),
+                                )
+                            }
+                            None => (true, "Билет для просмотра не найден".into()),
+                        },
                         (_, Err(e)) => (true, format!("Служба: {e}")),
                     });
                 }
+                UiEvent::Woke { target, via, ticket, macs, result } => match result {
+                    Ok(()) => {
+                        self.message = Some((
+                            false,
+                            format!(
+                                "«{via}» отправил сигнал пробуждения. «{target}» включится, если в его настройках включён Wake-on-LAN."
+                            ),
+                        ))
+                    }
+                    Err(WakeError::Pin(error)) => {
+                        self.pin_prompt = Some(PinPrompt {
+                            name: via,
+                            ticket,
+                            profile: Profile::Control,
+                            monitor: None,
+                            pin: String::new(),
+                            error,
+                            purpose: PinPurpose::Wake { target, macs },
+                        })
+                    }
+                    Err(WakeError::Other(e)) => {
+                        self.message = Some((true, format!("Не удалось разбудить «{target}»: {e}")))
+                    }
+                },
                 UiEvent::PinNeeded(error) => {
                     if let Some(d) = self.desktop.take() {
                         if d.fullscreen {
                             self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                         }
                         let (name, ticket, profile, monitor) = (d.name, d.ticket, d.profile, d.monitor);
-                        self.pin_prompt = Some(PinPrompt { name, ticket, profile, monitor, pin: String::new(), error });
+                        self.pin_prompt = Some(PinPrompt {
+                            name,
+                            ticket,
+                            profile,
+                            monitor,
+                            pin: String::new(),
+                            error,
+                            purpose: PinPurpose::Session,
+                        });
                     }
                 }
                 UiEvent::Connected { ticket } => {
@@ -449,14 +557,17 @@ impl App {
                     }
                 }
                 UiEvent::DesktopEnded(err) => {
+                    let mut saved = None;
                     if let Some(d) = self.desktop.take() {
+                        saved = finish_recording(&d);
                         if d.fullscreen {
                             self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                         }
                     }
+                    let saved = saved.map(|p| format!(" Запись: {}", p.display())).unwrap_or_default();
                     self.message = Some(match err {
-                        Some(e) => (true, format!("Сеанс завершён: {e}")),
-                        None => (false, "Сеанс завершён".into()),
+                        Some(e) => (true, format!("Сеанс завершён: {e}.{saved}")),
+                        None => (false, format!("Сеанс завершён.{saved}")),
                     });
                 }
             }
@@ -487,11 +598,13 @@ impl App {
         let ctx = self.ctx.clone();
         let repaint: viewer::Repaint = Arc::new(move || ctx.request_repaint());
         let (shared2, out_tx2, ticket_str2, pin2) = (shared.clone(), out_tx.clone(), ticket_str.clone(), pin.clone());
+        let (files_tx, files_rx) = tmpsc::unbounded_channel::<std::path::PathBuf>();
         let task = self.rt.spawn(async move {
             let res = async {
-                let session = client::connect(&ticket, profile, pin2.as_deref(), monitor).await?;
+                let codecs = client::decoder::supported();
+                let session = client::connect(&ticket, profile, pin2.as_deref(), monitor, &codecs).await?;
                 send(UiEvent::Connected { ticket: ticket_str2 });
-                viewer::run(session, shared2, out_tx2, out_rx, repaint, true).await
+                viewer::run(session, shared2, out_tx2, out_rx, files_rx, repaint, true).await
             }
             .await;
             match res.as_ref().err().and_then(|e| e.downcast_ref::<client::PinError>()) {
@@ -528,6 +641,30 @@ impl App {
             ink: Ink::default(),
             stroke_seq: 0,
             drawing: None,
+            files: files_tx,
+            clipboard_sync: true,
+            clipboard: arboard::Clipboard::new().ok(),
+            last_clip: None,
+            clip_checked: Instant::now(),
+            note_edit: None,
+            recording: None,
+            macs_saved: false,
+        });
+    }
+
+    /// Asks the online PC `via` to wake `target` with a Wake-on-LAN packet.
+    fn start_wake(&mut self, target: String, via: String, ticket_str: String, macs: Vec<[u8; 6]>, pin: Option<String>) {
+        let Ok(ticket) = Ticket::decode(&ticket_str) else { return };
+        let send = self.send_event();
+        self.message = Some((false, format!("Будим «{target}» через «{via}»…")));
+        self.rt.spawn(async move {
+            let result = client::wake(&ticket, pin.as_deref(), &macs).await.map_err(|e| {
+                match e.downcast_ref::<client::PinError>() {
+                    Some(p) => WakeError::Pin(p.0.clone()),
+                    None => WakeError::Other(format!("{e:#}")),
+                }
+            });
+            send(UiEvent::Woke { target, via, ticket: ticket_str, macs, result });
         });
     }
 
@@ -618,6 +755,9 @@ impl App {
         let mut order: Vec<usize> = (0..self.hosts.len()).collect();
         order.sort_by_key(|&i| !matches!(state(&self.hosts[i]), Some(Presence::Online(_))));
         let mut action: Option<(usize, &'static str)> = None;
+        let mut wake: Option<(usize, usize)> = None;
+        let online_hosts: Vec<usize> =
+            (0..self.hosts.len()).filter(|&i| matches!(state(&self.hosts[i]), Some(Presence::Online(_)))).collect();
         egui::ScrollArea::vertical().show(ui, |ui| {
             for i in order {
                 let h = &self.hosts[i];
@@ -668,6 +808,24 @@ impl App {
                                     ui.ctx().copy_text(h.ticket.clone());
                                     ui.close();
                                 }
+                                if !is_online {
+                                    let relays: Vec<usize> = online_hosts.iter().copied().filter(|&j| j != i).collect();
+                                    if h.macs.is_empty() || relays.is_empty() {
+                                        let why = if h.macs.is_empty() {
+                                            "Разбудить: сначала подключитесь к нему, когда он включён"
+                                        } else {
+                                            "Разбудить: нужен другой ПК с Panda в той же сети"
+                                        };
+                                        ui.add_enabled_ui(false, |ui| menu_item(ui, Icon::Wake, why, false));
+                                    }
+                                    for j in relays.into_iter().filter(|_| !h.macs.is_empty()) {
+                                        let label = format!("Разбудить через «{}»", self.hosts[j].name);
+                                        if menu_item(ui, Icon::Wake, &label, false).clicked() {
+                                            wake = Some((i, j));
+                                            ui.close();
+                                        }
+                                    }
+                                }
                                 if menu_item(ui, Icon::Trash, "Удалить", true).clicked() {
                                     action = Some((i, "delete"));
                                     ui.close();
@@ -692,6 +850,11 @@ impl App {
                 });
             }
         });
+        if let Some((target, via)) = wake {
+            let (t, v) = (self.hosts[target].clone(), self.hosts[via].clone());
+            let macs = t.macs.iter().filter_map(|m| host::net::parse_mac(m)).collect();
+            self.start_wake(t.name, v.name, v.ticket, macs, None);
+        }
         if let Some((i, what)) = action {
             let h = self.hosts[i].clone();
             match what {
@@ -742,7 +905,12 @@ impl App {
                             };
                             self.hosts
                                 .retain(|h| Ticket::decode(&h.ticket).map(|x| x.host_id != t.host_id).unwrap_or(true));
-                            self.hosts.push(SavedHost { name, ticket: t.encode(), last_connected: None });
+                            self.hosts.push(SavedHost {
+                                name,
+                                ticket: t.encode(),
+                                last_connected: None,
+                                macs: Vec::new(),
+                            });
                             let _ = config::save_hosts(&self.hosts);
                             self.new_name.clear();
                             self.new_ticket.clear();
@@ -856,6 +1024,24 @@ impl App {
                 });
                 ui.add_space(2.0);
                 self.ticket_row(ui, &ticket);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    icon(ui, Icon::Eye, MUTED, 16.0);
+                    ui.label("Билет для просмотра");
+                    ui.label(muted("— экран виден, управлять нельзя: показать другу").small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let busy = self.this_pc.service_busy;
+                        if ui
+                            .add_enabled_ui(!busy, |ui| {
+                                button_sized(ui, Some(Icon::Copy), "Копировать", Kind::Secondary, 28.0)
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            self.copy_view_ticket(service_mode);
+                        }
+                    });
+                });
             });
         } else if service_mode {
             card(ui, |ui| {
@@ -1137,6 +1323,24 @@ impl App {
         ui.ctx().request_repaint_after(Duration::from_secs(2));
     }
 
+    /// Copies the view-only ticket, creating its secret first if needed (with a UAC prompt for the service).
+    fn copy_view_ticket(&mut self, service_mode: bool) {
+        if let Some(t) = view_ticket() {
+            self.ctx.copy_text(t);
+            self.message =
+                Some((false, "Билет для просмотра скопирован: по нему видно экран, но управлять нельзя.".into()));
+            return;
+        }
+        if service_mode {
+            self.service_op(ServiceOp::ViewTicket);
+            return;
+        }
+        match HostConfig::load_or_create().and_then(|mut c| c.ensure_view_secret()) {
+            Ok(_) => self.copy_view_ticket(false),
+            Err(e) => self.message = Some((true, format!("{e:#}"))),
+        }
+    }
+
     /// Runs a service operation with a UAC prompt, off the UI thread.
     fn service_op(&mut self, op: ServiceOp) {
         #[cfg(windows)]
@@ -1149,6 +1353,7 @@ impl App {
                 ServiceOp::Install => "install".to_string(),
                 ServiceOp::Uninstall => "uninstall".to_string(),
                 ServiceOp::SyncTicket => format!("sync-ticket --to \"{}\"", config::user_dir().display()),
+                ServiceOp::ViewTicket => format!("view-ticket --to \"{}\"", config::user_dir().display()),
                 ServiceOp::SetPin(_) => {
                     format!("set-pin --pin-file \"{}\" --to \"{}\"", pin_file().display(), config::user_dir().display())
                 }
@@ -1228,7 +1433,10 @@ impl App {
             self.pin_prompt = None;
         } else if submit && !p.pin.is_empty() {
             let p = self.pin_prompt.take().unwrap();
-            self.start_session(p.name, p.ticket, p.profile, Some(p.pin), p.monitor);
+            match p.purpose {
+                PinPurpose::Session => self.start_session(p.name, p.ticket, p.profile, Some(p.pin), p.monitor),
+                PinPurpose::Wake { target, macs } => self.start_wake(target, p.name, p.ticket, macs, Some(p.pin)),
+            }
         }
     }
 
@@ -1248,6 +1456,10 @@ impl App {
                 ui.label(muted(short_status(&status)).small()).on_hover_text(&status);
                 ui.add_space(6.0);
 
+                let host_view_only = view.shared.host_view_only.load(Ordering::Relaxed);
+                if host_view_only && view.tool != Tool::View {
+                    set_tool(view, Tool::View, ui.ctx());
+                }
                 egui::Frame::new()
                     .fill(BG)
                     .stroke(egui::Stroke::new(1.0, BORDER))
@@ -1261,6 +1473,10 @@ impl App {
                             (Tool::Laser, Icon::Laser, "Указка: красная точка на удалённом экране"),
                             (Tool::View, Icon::Eye, "Только просмотр: экран виден, мышь, клавиатура и геймпад не передаются"),
                         ] {
+                            // With the view-only ticket the host ignores input anyway: offer only what works.
+                            if host_view_only && tool == Tool::Control {
+                                continue;
+                            }
                             let kind = if view.tool == tool { Kind::Active } else { Kind::Ghost };
                             if button_sized(ui, Some(ic), "", kind, 26.0).on_hover_text(tip).clicked() {
                                 set_tool(view, tool, ui.ctx());
@@ -1294,6 +1510,33 @@ impl App {
                     if button_sized(ui, Some(Icon::Close), "Отключиться", Kind::Danger, 28.0).clicked() {
                         disconnect = true;
                     }
+                    let more = button_sized(ui, Some(Icon::More), "", Kind::Ghost, 28.0).on_hover_text("Ещё");
+                    egui::Popup::menu(&more).show(|ui| {
+                        ui.set_min_width(240.0);
+                        let can_control = !host_view_only;
+                        if ui.add_enabled_ui(can_control, |ui| menu_item(ui, Icon::Download, "Отправить файл…", false)).inner.clicked() {
+                            pick_files(view.files.clone(), ui.ctx().clone());
+                            ui.close();
+                        }
+                        if menu_item(ui, Icon::Chat, "Сообщение на экран…", false).clicked() {
+                            view.note_edit = Some(String::new());
+                            ui.close();
+                        }
+                        let rec_label = if view.recording.is_some() { "Остановить запись" } else { "Записать сеанс" };
+                        if menu_item(ui, Icon::Record, rec_label, false).clicked() {
+                            toggle_recording(view);
+                            ui.close();
+                        }
+                        let clip_icon = if view.clipboard_sync { Icon::Check } else { Icon::Copy };
+                        if ui.add_enabled_ui(can_control, |ui| menu_item(ui, clip_icon, "Общий буфер обмена", false)).inner.clicked() {
+                            view.clipboard_sync ^= true;
+                            ui.close();
+                        }
+                        if ui.add_enabled_ui(can_control && view.tool != Tool::View, |ui| menu_item(ui, Icon::Lock, "Ctrl+Alt+Del", false)).inner.clicked() {
+                            let _ = view.out.send(ClientMsg::SecureAttention);
+                            ui.close();
+                        }
+                    });
                     if button_sized(ui, Some(Icon::Expand), "", Kind::Ghost, 28.0)
                         .on_hover_text("Во весь экран (F11 — выйти)")
                         .clicked()
@@ -1319,12 +1562,19 @@ impl App {
                             }
                         });
                     }
-                    if view.tool != Tool::View
-                        && button_sized(ui, None, "Ctrl+Alt+Del", Kind::Ghost, 28.0)
-                            .on_hover_text("Нажать Ctrl+Alt+Del на удалённом ПК (нужна служба Windows на нём)")
-                            .clicked()
-                    {
-                        let _ = view.out.send(ClientMsg::SecureAttention);
+                    if let Some(started) = view.recording {
+                        let secs = started.elapsed().as_secs();
+                        chip(ui, Icon::Record, &format!("Запись {:02}:{:02}", secs / 60, secs % 60), RED, DANGER_FILL)
+                            .on_hover_text("Сохраняется в папку «Видео\\Panda»; остановить — в меню «Ещё»");
+                        ui.ctx().request_repaint_after(Duration::from_millis(500));
+                    }
+                    if let Some((name, sent, total)) = view.shared.transfer.lock().unwrap().clone() {
+                        let pct = if total > 0 { sent * 100 / total } else { 0 };
+                        chip(ui, Icon::Download, &format!("{name} · {pct}%"), ACCENT_SOFT, ACCENT_TILE);
+                    }
+                    if host_view_only {
+                        chip(ui, Icon::Eye, "Только просмотр", ACCENT_SOFT, ACCENT_TILE)
+                            .on_hover_text("Вы подключились по билету для просмотра: управлять этим ПК нельзя");
                     }
                     if view.shared.secure_desktop.load(Ordering::Relaxed) {
                         chip(ui, Icon::Lock, "Экран блокировки", YELLOW, YELLOW_TILE).on_hover_text(
@@ -1340,6 +1590,47 @@ impl App {
                     }
                 });
             });
+            if let Some(mut text) = view.note_edit.take() {
+                let mut keep = true;
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    icon(ui, Icon::Chat, MUTED, 16.0);
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .hint_text("Текст появится вверху экрана удалённого ПК на 6 секунд")
+                            .desired_width(420.0)
+                            .char_limit(160)
+                            .margin(egui::Margin::symmetric(10, 6)),
+                    );
+                    resp.request_focus();
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let send = button_sized(ui, None, "Показать", Kind::Primary, 28.0).clicked() || enter;
+                    let cancel = button_sized(ui, None, "Отмена", Kind::Ghost, 28.0).clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if send && !text.trim().is_empty() {
+                        let _ = view.out.send(ClientMsg::Message(text.trim().to_string()));
+                        keep = false;
+                    } else if cancel {
+                        keep = false;
+                    }
+                });
+                if keep {
+                    view.note_edit = Some(text);
+                }
+            }
+            let notes: Vec<_> = {
+                let mut notes = view.shared.notes.lock().unwrap();
+                notes.retain(|(at, _, _)| at.elapsed() < Duration::from_secs(8));
+                notes.clone()
+            };
+            for (_, error, text) in notes {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    status_dot(ui, if error { RED } else { GREEN });
+                    ui.add(egui::Label::new(egui::RichText::new(text).small().color(if error { RED } else { SOFT })).truncate());
+                });
+                ui.ctx().request_repaint_after(Duration::from_secs(1));
+            }
         });
         disconnect
     }
@@ -1348,9 +1639,29 @@ impl App {
         let gpu_video = self.gpu_video;
         let fullscreen = self.desktop.as_ref().is_some_and(|v| v.fullscreen);
         let disconnect = if fullscreen { false } else { self.session_toolbar(ui) };
+        // Remember the host's network addresses with the computer, for waking it later.
+        if let Some(view) = self.desktop.as_mut()
+            && !view.macs_saved
+        {
+            let macs: Vec<String> = view.shared.macs.lock().unwrap().iter().map(host::net::format_mac).collect();
+            if !macs.is_empty() {
+                view.macs_saved = true;
+                if let Some(h) = self.hosts.iter_mut().find(|h| h.ticket == view.ticket)
+                    && h.macs != macs
+                {
+                    h.macs = macs;
+                    let _ = config::save_hosts(&self.hosts);
+                }
+            }
+        }
         let Some(view) = self.desktop.as_mut() else {
             return;
         };
+        sync_clipboard(view);
+        let (dropped, hovering) = ui.input(|i| (i.raw.dropped_files.clone(), !i.raw.hovered_files.is_empty()));
+        for f in dropped {
+            let _ = view.files.send(f.path().to_path_buf());
+        }
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
             ui.painter().rect_filled(ui.max_rect(), 0.0, Color32::BLACK);
@@ -1417,9 +1728,22 @@ impl App {
                 remote_input(view, &events, mods, rect, ui.ctx());
             }
             paint_ink(ui.painter(), &mut view.ink, rect);
+            if hovering {
+                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(140));
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Отпустите, чтобы отправить на удалённый ПК (в «Загрузки\\Panda»)",
+                    egui::FontId::proportional(18.0),
+                    TEXT,
+                );
+            }
         });
 
         if disconnect && let Some(mut d) = self.desktop.take() {
+            if let Some(path) = finish_recording(&d) {
+                self.message = Some((false, format!("Запись сохранена: {}", path.display())));
+            }
             if let Some(g) = d.game.as_mut() {
                 release_capture(g, &d.out, ui.ctx());
             }
@@ -1448,6 +1772,26 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_events();
         self.maybe_apply_update(false);
+        // Closing the window hides it to the tray (Panda keeps the host and updates running);
+        // during a session, closing first ends the session.
+        #[cfg(windows)]
+        if ui.ctx().input(|i| i.viewport().close_requested()) && self.tray.is_some() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if let Some(mut d) = self.desktop.take() {
+                if let Some(path) = finish_recording(&d) {
+                    self.message = Some((false, format!("Запись сохранена: {}", path.display())));
+                }
+                if let Some(g) = d.game.as_mut() {
+                    release_capture(g, &d.out, ui.ctx());
+                }
+                if d.fullscreen {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                }
+                d.task.abort();
+            } else if let Some(tray) = &self.tray {
+                tray.hide_window();
+            }
+        }
 
         if self.desktop.is_some() {
             self.desktop_view(ui);
@@ -1503,6 +1847,12 @@ impl eframe::App for App {
         });
         self.pin_dialog(&ui.ctx().clone());
     }
+}
+
+/// The view-only ticket from this user's host files, if its secret exists.
+fn view_ticket() -> Option<String> {
+    let (id, cfg) = config::user_host()?;
+    Some(Ticket { host_id: id, secret: cfg.view_secret? }.encode())
 }
 
 /// Where a new service PIN waits for the elevated step that applies it (and deletes the file).
@@ -1824,6 +2174,84 @@ enum Tool {
     Laser,
     /// Watch only: nothing is sent to the remote PC.
     View,
+}
+
+/// Opens a file dialog off the UI thread and queues the chosen files for sending.
+fn pick_files(files: tmpsc::UnboundedSender<std::path::PathBuf>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        if let Some(paths) = rfd::FileDialog::new().set_title("Отправить на удалённый ПК").pick_files()
+        {
+            for p in paths {
+                let _ = files.send(p);
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Shared clipboard, viewer side: text copied here goes to the host, text copied there lands here.
+fn sync_clipboard(view: &mut DesktopView) {
+    if !view.clipboard_sync || view.shared.host_view_only.load(Ordering::Relaxed) {
+        view.shared.remote_clipboard.lock().unwrap().take();
+        return;
+    }
+    let Some(clip) = view.clipboard.as_mut() else { return };
+    if let Some(text) = view.shared.remote_clipboard.lock().unwrap().take() {
+        if clip.set_text(text.clone()).is_ok() {
+            view.last_clip = Some(text);
+        }
+    }
+    if view.clip_checked.elapsed() < Duration::from_millis(500) {
+        return;
+    }
+    view.clip_checked = Instant::now();
+    let Ok(text) = clip.get_text() else { return };
+    if text.is_empty() || text.len() > proto::MAX_CLIPBOARD {
+        return;
+    }
+    match &view.last_clip {
+        // The first look only remembers what was there before the session.
+        None => view.last_clip = Some(text),
+        Some(last) if *last != text => {
+            view.last_clip = Some(text.clone());
+            let _ = view.out.send(ClientMsg::Clipboard(text));
+        }
+        _ => {}
+    }
+}
+
+/// Starts or stops recording the session. The remote screen shows a note when a recording starts.
+fn toggle_recording(view: &mut DesktopView) {
+    if view.recording.is_some() {
+        if let Some(path) = finish_recording(view) {
+            view.shared.note(false, format!("Запись сохранена: {}", path.display()));
+        }
+        view.recording = None;
+        return;
+    }
+    let Some((codec, w, h)) = *view.shared.stream.lock().unwrap() else { return };
+    match client::record::Recorder::start(&client::record::videos_dir(), &view.name, codec, w, h) {
+        Ok(rec) => {
+            *view.shared.recorder.lock().unwrap() = Some(rec);
+            view.recording = Some(Instant::now());
+            // Recording starts at a keyframe; ask for one now instead of waiting.
+            let _ = view.out.send(ClientMsg::RequestKeyframe);
+            let _ = view.out.send(ClientMsg::Message("Этот сеанс записывается".into()));
+        }
+        Err(e) => view.shared.note(true, format!("Запись не началась: {e:#}")),
+    }
+}
+
+/// Closes the recording file, if any; returns where it was saved.
+fn finish_recording(view: &DesktopView) -> Option<std::path::PathBuf> {
+    let rec = view.shared.recorder.lock().unwrap().take()?;
+    match rec.finish() {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!("recording not saved: {e:#}");
+            None
+        }
+    }
 }
 
 /// Switches the session tool; entering view-only first lets go of everything held on the remote PC.

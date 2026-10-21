@@ -13,14 +13,18 @@ use tokio::sync::oneshot;
 use super::{
     audio,
     capture::{self, Control},
-    gamepad, input,
+    clipboard, files, gamepad, input, net,
 };
-use crate::proto::{self, ClientMsg, HostMsg, Profile};
+use crate::proto::{self, ClientMsg, Codec, HostMsg, Profile};
 
+/// `view_only`: the viewer came with the view-only ticket, so its input, clipboard and files are ignored
+/// (drawing and notes still show: they only point at things).
 pub async fn serve(
     conn: &Connection,
     profile: Profile,
     monitor: Option<u8>,
+    codecs: Vec<Codec>,
+    view_only: bool,
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> Result<()> {
@@ -33,20 +37,20 @@ pub async fn serve(
         let (conn, control) = (conn.clone(), control.clone());
         std::thread::Builder::new()
             .name("capture".into())
-            .spawn(move || capture::run(conn, profile, monitor.map(usize::from), control, start_tx))?;
+            .spawn(move || capture::run(conn, profile, monitor.map(usize::from), codecs, control, start_tx))?;
     }
     let start = start_rx.await??;
     tracing::info!(encoder = %start.encoder, profile = profile.name(), "stream started");
     let (rumble_tx, mut rumble_rx) = tokio::sync::mpsc::unbounded_channel();
     let (pad_tx, gamepad_error) = match profile {
-        Profile::Game => match gamepad::spawn(rumble_tx) {
+        Profile::Game if !view_only => match gamepad::spawn(rumble_tx) {
             Ok(tx) => (Some(tx), None),
             Err(e) => {
                 tracing::warn!("virtual gamepad unavailable: {e:#}");
                 (None, Some(format!("{e:#}")))
             }
         },
-        Profile::Desktop => (None, None),
+        _ => (None, None),
     };
     tracing::info!("starting audio");
     let audio_stop = Arc::new(AtomicBool::new(false));
@@ -66,18 +70,44 @@ pub async fn serve(
         gamepad_error,
         monitors: start.monitors,
         monitor: start.monitor,
+        codec: start.codec,
+        view_only,
+        macs: net::macs(),
     };
     proto::write_msg(&mut send, &info).await?;
 
     let input_tx = input::spawn(start.place);
     let mut abr = Abr { current: start_bitrate, min: min_bitrate, max: max_bitrate, clean_seconds: 0 };
 
-    // Created on the first drawing event, so sessions that never draw don't put a window on screen.
+    // Messages to the viewer from other tasks (clipboard, received files) go out through the notify loop.
+    let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel::<HostMsg>();
+    let clipboard = clipboard::Shared::default();
+    let side_stop = Arc::new(AtomicBool::new(false));
+    if !view_only {
+        let tx = host_tx.clone();
+        clipboard.watch(side_stop.clone(), move |text| drop(tx.send(HostMsg::Clipboard(text))));
+    }
+    // Files arrive on their own streams, one per file.
+    let receive_files = async {
+        loop {
+            let recv = conn.accept_uni().await?;
+            let tx = host_tx.clone();
+            tokio::spawn(async move {
+                let (name, result) = files::receive(recv, !view_only).await;
+                let _ = tx.send(HostMsg::FileSaved { name, result });
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    };
+    // Created on the first drawing event or note, so most sessions don't put a window on screen.
     #[cfg(windows)]
-    let mut overlay: Option<std::sync::mpsc::Sender<crate::media::annotate::DrawEvent>> = None;
+    let mut overlay: Option<std::sync::mpsc::Sender<super::overlay::Overlay>> = None;
     let control_loop = async {
         loop {
             match proto::read_msg::<ClientMsg>(&mut recv).await? {
+                ClientMsg::Input(_) | ClientMsg::Gamepad(_) | ClientMsg::SecureAttention | ClientMsg::Clipboard(_)
+                    if view_only => {}
                 ClientMsg::Input(ev) => {
                     let _ = input_tx.send(ev);
                 }
@@ -86,13 +116,27 @@ pub async fn serve(
                         let _ = tx.send(state);
                     }
                 }
+                ClientMsg::Clipboard(text) => {
+                    let clipboard = clipboard.clone();
+                    // The clipboard API may block briefly; keep it off the network task.
+                    tokio::task::spawn_blocking(move || clipboard.set(text));
+                }
                 ClientMsg::Draw(ev) => {
                     #[cfg(windows)]
                     {
-                        let _ = overlay.get_or_insert_with(super::overlay::spawn).send(ev);
+                        let _ =
+                            overlay.get_or_insert_with(super::overlay::spawn).send(super::overlay::Overlay::Draw(ev));
                     }
                     #[cfg(not(windows))]
                     let _ = ev;
+                }
+                ClientMsg::Message(text) => {
+                    tracing::info!(%text, "note from the viewer");
+                    #[cfg(windows)]
+                    {
+                        let _ =
+                            overlay.get_or_insert_with(super::overlay::spawn).send(super::overlay::Overlay::Note(text));
+                    }
                 }
                 ClientMsg::RequestKeyframe => control.keyframe.store(true, Ordering::Relaxed),
                 ClientMsg::SecureAttention =>
@@ -126,6 +170,7 @@ pub async fn serve(
                     Some((large, small)) => proto::write_msg(&mut send, &HostMsg::Rumble { large, small }).await?,
                     None => rumble_open = false,
                 },
+                Some(msg) = host_rx.recv() => proto::write_msg(&mut send, &msg).await?,
                 _ = tick.tick() => {
                     if session_locked() {
                         was_locked.store(true, Ordering::Relaxed);
@@ -145,9 +190,11 @@ pub async fn serve(
     let result: Result<()> = tokio::select! {
         r = control_loop => r,
         r = notify => r,
+        r = receive_files => r,
         _ = conn.closed() => Ok(()),
     };
     control.stop.store(true, Ordering::Relaxed);
+    side_stop.store(true, Ordering::Relaxed);
     if was_locked.load(Ordering::Relaxed) && !session_locked() {
         #[cfg(windows)]
         super::desktop_switch::lock_session();

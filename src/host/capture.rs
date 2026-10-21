@@ -36,6 +36,7 @@ pub struct StreamStart {
     pub monitor: u8,
     /// Where the streamed monitor sits on the virtual desktop (for mouse positions); `None` = primary.
     pub place: Option<Place>,
+    pub codec: crate::proto::Codec,
 }
 
 /// A monitor rectangle on the virtual desktop.
@@ -85,6 +86,8 @@ pub struct Control {
     pub bitrate: AtomicU32,
     /// Last frame id sent; kept here so a restarted capture thread continues the sequence.
     frame_id: AtomicU32,
+    /// Codec chosen for this session.
+    codec: std::sync::OnceLock<crate::proto::Codec>,
 }
 
 /// Why a capture thread ended without an error.
@@ -98,6 +101,7 @@ pub fn run(
     conn: Connection,
     profile: Profile,
     monitor: Option<usize>,
+    codecs: Vec<crate::proto::Codec>,
     control: Arc<Control>,
     start_tx: oneshot::Sender<Result<StreamStart>>,
 ) {
@@ -108,7 +112,7 @@ pub fn run(
         let result = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .name("capture".into())
-                .spawn_scoped(scope, || capture_loop(&conn, profile, monitor, &control, &mut start_tx))
+                .spawn_scoped(scope, || capture_loop(&conn, profile, monitor, &codecs, &control, &mut start_tx))
                 .map_err(anyhow::Error::from)
                 .and_then(|t| t.join().map_err(|_| anyhow::anyhow!("capture thread panicked"))?)
         });
@@ -206,6 +210,7 @@ fn capture_loop(
     conn: &Connection,
     profile: Profile,
     monitor: Option<usize>,
+    codecs: &[crate::proto::Codec],
     control: &Control,
     start_tx: &mut Option<oneshot::Sender<Result<StreamStart>>>,
 ) -> Result<Exit> {
@@ -219,12 +224,18 @@ fn capture_loop(
 
     let fps = profile.fps();
     let mut bitrate = control.bitrate.load(Ordering::Relaxed);
-    let mut encoder = encoder::create(w, h, fps, bitrate, true)?;
+    // A restarted capture thread (desktop switch) must keep the codec the viewer is decoding.
+    let accepted = match control.codec.get() {
+        Some(c) => vec![*c],
+        None => codecs.to_vec(),
+    };
+    let (codec, mut encoder) = encoder::create(&accepted, w, h, fps, bitrate, true)?;
+    let _ = control.codec.set(codec);
     tracing::info!(encoder = %encoder.name(), "encoder ready");
     if let Some(tx) = start_tx.take() {
         let (monitors, chosen, place) = monitor_labels(monitor);
         let place = if source.kind() == "dxgi" { place } else { None };
-        let _ = tx.send(Ok(StreamStart { geometry, encoder: encoder.name(), monitors, monitor: chosen, place }));
+        let _ = tx.send(Ok(StreamStart { geometry, encoder: encoder.name(), monitors, monitor: chosen, place, codec }));
     }
 
     let interval = Duration::from_secs_f64(1.0 / fps as f64);

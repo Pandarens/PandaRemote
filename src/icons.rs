@@ -33,6 +33,10 @@ pub enum Icon {
     Rename,
     Trash,
     Check,
+    Download,
+    Chat,
+    Record,
+    Wake,
 }
 
 const LINE: &str = r#"fill="none" stroke="white" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round""#;
@@ -91,6 +95,10 @@ impl Icon {
             Icon::Chevron => line(r#"<path d="M9 6l6 6-6 6"/>"#),
             Icon::ChevronDown => line(r#"<path d="M6 9l6 6 6-6"/>"#),
             Icon::Rename => line(r#"<path d="M4 20h4L19 9l-4-4L4 16z"/>"#),
+            Icon::Download => line(r#"<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>"#),
+            Icon::Chat => line(r#"<path d="M4 5h16v11H9l-5 4z"/><path d="M8 9.5h8M8 12.5h5"/>"#),
+            Icon::Record => r#"<circle cx="12" cy="12" r="7" fill="none" stroke="white" stroke-width="1.75"/><circle cx="12" cy="12" r="3.5" fill="white"/>"#.into(),
+            Icon::Wake => line(r#"<path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/><circle cx="12" cy="12" r="3.5"/>"#),
             Icon::Check => line(r#"<path d="M5 12.5l4.5 4.5L19 7.5"/>"#),
             Icon::Trash => line(r#"<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>"#),
         }
@@ -107,6 +115,28 @@ impl Icon {
         }
         egui::ColorImage::from_rgba_premultiplied([px as usize, px as usize], pixmap.data())
     }
+}
+
+/// The app icon (white panda on a dark rounded square), RGBA straight alpha, for the tray.
+pub fn app_icon_rgba(px: u32) -> Vec<u8> {
+    use resvg::{tiny_skia, usvg};
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="0.5" y="0.5" width="23" height="23" rx="6" fill="#1D212A"/><g transform="translate(2.4 2.4) scale(0.8)">{}</g></svg>"##,
+        Icon::Panda.body()
+    );
+    let mut pixmap = tiny_skia::Pixmap::new(px, px).expect("icon size");
+    if let Ok(tree) = usvg::Tree::from_str(&svg, &usvg::Options::default()) {
+        let s = px as f32 / 24.0;
+        resvg::render(&tree, tiny_skia::Transform::from_scale(s, s), &mut pixmap.as_mut());
+    }
+    pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -164,6 +194,10 @@ mod tests {
             Icon::Rename,
             Icon::Trash,
             Icon::Check,
+            Icon::Download,
+            Icon::Chat,
+            Icon::Record,
+            Icon::Wake,
         ] {
             let img = icon.rasterize(32);
             let ink = img.pixels.iter().filter(|p| p.a() > 0).count();

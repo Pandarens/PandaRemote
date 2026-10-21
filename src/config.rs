@@ -130,6 +130,9 @@ pub struct HostConfig {
     /// Asked after the ticket when set: a ticket alone is then not enough to get in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<PinHash>,
+    /// Secret of the view-only ticket (see the picture, no control), created when first asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "hex32_opt")]
+    pub view_secret: Option<[u8; 32]>,
 }
 
 impl HostConfig {
@@ -137,7 +140,7 @@ impl HostConfig {
         if let Some(cfg) = Self::load()? {
             return Ok(cfg);
         }
-        let cfg = HostConfig { name: machine_name(), access_secret: random_bytes(), pin: None };
+        let cfg = HostConfig { name: machine_name(), access_secret: random_bytes(), pin: None, view_secret: None };
         cfg.save()?;
         Ok(cfg)
     }
@@ -156,9 +159,24 @@ impl HostConfig {
         Ok(())
     }
 
+    /// New secrets for both tickets: every ticket handed out stops working.
     pub fn rotate_secret(&mut self) -> Result<()> {
         self.access_secret = random_bytes();
+        if self.view_secret.is_some() {
+            self.view_secret = Some(random_bytes());
+        }
         self.save()
+    }
+
+    /// The view-only secret, created (and saved) on first use.
+    pub fn ensure_view_secret(&mut self) -> Result<[u8; 32]> {
+        if let Some(s) = self.view_secret {
+            return Ok(s);
+        }
+        let s = random_bytes();
+        self.view_secret = Some(s);
+        self.save()?;
+        Ok(s)
     }
 
     /// Sets (or with `None` removes) the PIN.
@@ -203,6 +221,23 @@ pub fn user_host() -> Option<(iroh::EndpointId, HostConfig)> {
     let key: [u8; 32] = fs::read(dir.join("host.key")).ok()?.try_into().ok()?;
     let cfg = serde_json::from_str(&fs::read_to_string(dir.join("host.json")).ok()?).ok()?;
     Some((SecretKey::from_bytes(&key).public(), cfg))
+}
+
+mod hex32_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_str(&data_encoding::HEXLOWER.encode(b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
+        let Some(text) = Option::<String>::deserialize(d)? else { return Ok(None) };
+        let bytes = data_encoding::HEXLOWER.decode(text.as_bytes()).map_err(serde::de::Error::custom)?;
+        Ok(Some(bytes.try_into().map_err(|_| serde::de::Error::custom("expected 32 bytes"))?))
+    }
 }
 
 mod hex32 {
@@ -265,6 +300,9 @@ pub struct SavedHost {
     pub ticket: String,
     #[serde(default)]
     pub last_connected: Option<String>,
+    /// Network card addresses the host reported, for Wake-on-LAN ("70-85-C2-0A-1B-FF").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macs: Vec<String>,
 }
 
 pub fn load_hosts() -> Vec<SavedHost> {

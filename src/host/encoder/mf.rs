@@ -1,4 +1,4 @@
-//! Hardware H.264 through a Media Foundation transform (Intel QuickSync, NVIDIA NVENC, AMD AMF).
+//! Hardware H.264 / HEVC / AV1 through a Media Foundation transform (Intel QuickSync, NVIDIA NVENC, AMD AMF).
 //! Hardware MFTs are asynchronous: they announce `METransformNeedInput` / `METransformHaveOutput`
 //! events, and we drive them from the capture thread without extra threads.
 
@@ -20,6 +20,15 @@ use windows::{
 };
 
 use super::{EncodedFrame, Picture, VideoEncoder, to_nv12};
+use crate::proto::Codec;
+
+fn subtype(codec: Codec) -> GUID {
+    match codec {
+        Codec::H264 => MFVideoFormat_H264,
+        Codec::Hevc => MFVideoFormat_HEVC,
+        Codec::Av1 => MFVideoFormat_AV1,
+    }
+}
 
 pub struct MfEncoder {
     transform: IMFTransform,
@@ -57,13 +66,13 @@ fn variant_bool(v: bool) -> VARIANT {
 }
 
 impl MfEncoder {
-    pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
+    pub fn new(codec: Codec, width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
         unsafe {
             // S_FALSE / RPC_E_CHANGED_MODE just mean COM is already initialised on this thread.
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).context("MFStartup")?;
         }
-        let (transform, name) = activate_hardware_encoder()?;
+        let (transform, name) = activate_hardware_encoder(codec)?;
         unsafe {
             let attrs = transform.GetAttributes()?;
             // Required before an async MFT accepts any call.
@@ -76,14 +85,18 @@ impl MfEncoder {
         unsafe {
             let out = MFCreateMediaType()?;
             out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            out.SetGUID(&MF_MT_SUBTYPE, &subtype(codec))?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
             out.SetUINT64(&MF_MT_FRAME_SIZE, ((width as u64) << 32) | height as u64)?;
             out.SetUINT64(&MF_MT_FRAME_RATE, ((fps as u64) << 32) | 1)?;
             out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1 << 32) | 1)?;
             out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            // Baseline: no B-frames (no reordering delay) and decodable by every client.
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+            match codec {
+                // Baseline: no B-frames (no reordering delay) and decodable by every client.
+                Codec::H264 => out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?,
+                Codec::Hevc => out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?,
+                Codec::Av1 => {}
+            }
             transform.SetOutputType(output_id, &out, 0).context("SetOutputType")?;
 
             let input = find_nv12_input(&transform, input_id)?;
@@ -93,8 +106,8 @@ impl MfEncoder {
             transform.SetInputType(input_id, &input, 0).context("SetInputType")?;
         }
 
-        let codec = transform.cast::<ICodecAPI>().ok();
-        if let Some(c) = &codec {
+        let codec_api = transform.cast::<ICodecAPI>().ok();
+        if let Some(c) = &codec_api {
             unsafe {
                 let _ = c.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true));
                 let _ = c.SetValue(
@@ -111,11 +124,12 @@ impl MfEncoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
-        tracing::info!(encoder = %name, async_mft = events.is_some(), "hardware H.264 encoder ready");
+        let name = format!("{name} · {}", codec.name());
+        tracing::info!(encoder = %name, async_mft = events.is_some(), "hardware encoder ready");
         Ok(MfEncoder {
             transform,
             events,
-            codec,
+            codec: codec_api,
             input_id,
             output_id,
             fps,
@@ -263,9 +277,56 @@ impl Drop for MfEncoder {
     }
 }
 
-fn activate_hardware_encoder() -> Result<(IMFTransform, String)> {
+/// Hardware encoders present for each codec (diagnostics).
+pub fn available() -> Vec<(Codec, String)> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    }
+    Codec::PREFERENCE
+        .into_iter()
+        .flat_map(|c| {
+            enum_names(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, Some(MFVideoFormat_NV12), Some(subtype(c)))
+                .into_iter()
+                .map(move |n| (c, n))
+        })
+        .collect()
+}
+
+/// Friendly names of the MFTs matching a category and types.
+fn enum_names(category: GUID, flags: MFT_ENUM_FLAG, input: Option<GUID>, output: Option<GUID>) -> Vec<String> {
+    let input = input.map(|g| MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: g });
+    let output = output.map(|g| MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: g });
+    let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    let mut names = Vec::new();
+    unsafe {
+        if MFTEnumEx(
+            category,
+            flags | MFT_ENUM_FLAG_SORTANDFILTER,
+            input.as_ref().map(|i| i as *const _),
+            output.as_ref().map(|o| o as *const _),
+            &mut list,
+            &mut count,
+        )
+        .is_err()
+            || list.is_null()
+        {
+            return names;
+        }
+        for slot in std::slice::from_raw_parts_mut(list, count as usize) {
+            if let Some(a) = slot.take() {
+                names.push(friendly_name(&a).unwrap_or_else(|| "MFT".into()));
+            }
+        }
+        CoTaskMemFree(Some(list as *const _));
+    }
+    names
+}
+
+fn activate_hardware_encoder(codec: Codec) -> Result<(IMFTransform, String)> {
     let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
-    let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+    let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype(codec) };
     let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
     unsafe {
@@ -279,10 +340,10 @@ fn activate_hardware_encoder() -> Result<(IMFTransform, String)> {
         )
         .context("MFTEnumEx")?;
         if count == 0 || list.is_null() {
-            bail!("no hardware H.264 encoder");
+            bail!("no hardware {} encoder", codec.name());
         }
         let activates = std::slice::from_raw_parts_mut(list, count as usize);
-        let mut result = Err(anyhow::anyhow!("no hardware H.264 encoder could be activated"));
+        let mut result = Err(anyhow::anyhow!("no hardware {} encoder could be activated", codec.name()));
         for slot in activates.iter_mut() {
             let Some(activate) = slot.take() else {
                 continue;

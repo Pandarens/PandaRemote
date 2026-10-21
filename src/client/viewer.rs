@@ -17,7 +17,7 @@ use crate::{
         audio as audio_pkt,
         fec::{self, Frame, Reassembler},
     },
-    proto::{self, ClientMsg, GamepadState, HostMsg, InputEvent},
+    proto::{self, ClientMsg, Codec, GamepadState, HostMsg, InputEvent},
 };
 
 /// Decoded picture in NV12: full-resolution luma plus interleaved half-resolution chroma, tightly packed.
@@ -53,6 +53,20 @@ pub struct Shared {
     pub view_only: AtomicBool,
     /// The host's monitors and the index of the streamed one.
     pub monitors: Mutex<(Vec<String>, u8)>,
+    /// Codec and picture size of the stream (known once the host answered).
+    pub stream: Mutex<Option<(Codec, u32, u32)>>,
+    /// The host let us in with the view-only ticket.
+    pub host_view_only: AtomicBool,
+    /// The host's network card addresses (for Wake-on-LAN later).
+    pub macs: Mutex<Vec<[u8; 6]>>,
+    /// Text the host copied, not yet put on this PC's clipboard.
+    pub remote_clipboard: Mutex<Option<String>>,
+    /// Short notes for the toolbar (file saved, recording finished), newest last.
+    pub notes: Mutex<Vec<(Instant, bool, String)>>,
+    /// File being sent: name, bytes sent, size.
+    pub transfer: Mutex<Option<(String, u64, u64)>>,
+    /// Active recording.
+    pub recorder: Mutex<Option<super::record::Recorder>>,
     pub decoded: AtomicU32,
     assembled: AtomicU32,
     lost: AtomicU32,
@@ -60,6 +74,16 @@ pub struct Shared {
 }
 
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
+
+impl Shared {
+    /// Adds a toolbar note (`error` shows it in red).
+    pub fn note(&self, error: bool, text: impl Into<String>) {
+        let mut notes = self.notes.lock().unwrap();
+        notes.push((Instant::now(), error, text.into()));
+        let excess = notes.len().saturating_sub(4);
+        notes.drain(..excess);
+    }
+}
 
 /// In view-only mode: only releases (so no key, button or stick stays held) and non-input messages go out.
 fn allowed_when_viewing(msg: &ClientMsg) -> bool {
@@ -69,7 +93,7 @@ fn allowed_when_viewing(msg: &ClientMsg) -> bool {
             | InputEvent::Key { down: false, .. }
             | InputEvent::Scancode { down: false, .. },
         ) => true,
-        ClientMsg::Input(_) | ClientMsg::SecureAttention => false,
+        ClientMsg::Input(_) | ClientMsg::SecureAttention | ClientMsg::Clipboard(_) => false,
         ClientMsg::Gamepad(state) => *state == GamepadState::default(),
         _ => true,
     }
@@ -80,17 +104,35 @@ pub async fn run(
     shared: Arc<Shared>,
     out_tx: mpsc::UnboundedSender<ClientMsg>,
     mut out_rx: mpsc::UnboundedReceiver<ClientMsg>,
+    mut files_rx: mpsc::UnboundedReceiver<std::path::PathBuf>,
     repaint: Repaint,
     play_audio: bool,
 ) -> Result<()> {
     let Session { conn, mut send, mut recv, .. } = session;
-    let HostMsg::StreamInfo { width, height, fps, encoder, audio: has_audio, gamepad_error, monitors, monitor } =
-        proto::read_msg(&mut recv).await?
+    let HostMsg::StreamInfo {
+        width,
+        height,
+        fps,
+        encoder,
+        audio: has_audio,
+        gamepad_error,
+        monitors,
+        monitor,
+        codec,
+        view_only,
+        macs,
+    } = proto::read_msg(&mut recv).await?
     else {
         anyhow::bail!("expected StreamInfo");
     };
     *shared.notice.lock().unwrap() = gamepad_error;
     *shared.monitors.lock().unwrap() = (monitors, monitor);
+    *shared.stream.lock().unwrap() = Some((codec, width, height));
+    *shared.macs.lock().unwrap() = macs;
+    if view_only {
+        shared.host_view_only.store(true, Ordering::Relaxed);
+        shared.view_only.store(true, Ordering::Relaxed);
+    }
     let audio_tx = (has_audio && play_audio).then(audio::spawn);
     tracing::info!(width, height, fps, %encoder, "stream info");
 
@@ -102,7 +144,7 @@ pub async fn run(
         let (shared, repaint, out_tx, resync) = (shared.clone(), repaint.clone(), out_tx.clone(), resync.clone());
         std::thread::Builder::new()
             .name("decoder".into())
-            .spawn(move || decode_loop(dec_rx, shared, out_tx, resync, repaint, (width, height)))?;
+            .spawn(move || decode_loop(dec_rx, shared, out_tx, resync, repaint, codec, (width, height)))?;
     }
 
     let receive = async {
@@ -123,6 +165,11 @@ pub async fn run(
             }
             if let Some(frame) = reasm.push(dgram) {
                 shared.assembled.fetch_add(1, Ordering::Relaxed);
+                if let Some(rec) = shared.recorder.lock().unwrap().as_mut()
+                    && let Err(e) = rec.push(&frame.data, frame.keyframe)
+                {
+                    tracing::warn!("recording: {e:#}");
+                }
                 if dec_tx.try_send(frame).is_err() {
                     resync.store(true, Ordering::Relaxed);
                 }
@@ -147,6 +194,17 @@ pub async fn run(
                     shared.secure_desktop.store(on, Ordering::Relaxed);
                     repaint();
                 }
+                HostMsg::Clipboard(text) => {
+                    *shared.remote_clipboard.lock().unwrap() = Some(text);
+                    repaint();
+                }
+                HostMsg::FileSaved { name, result } => {
+                    match result {
+                        Ok(path) => shared.note(false, format!("«{name}» сохранён: {path}")),
+                        Err(e) => shared.note(true, format!("«{name}» не передан: {e}")),
+                    }
+                    repaint();
+                }
                 _ => {}
             }
         }
@@ -162,6 +220,33 @@ pub async fn run(
         }
         anyhow::Ok(())
     };
+    // Files go one after another, each on its own stream.
+    let send_files = async {
+        while let Some(path) = files_rx.recv().await {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if shared.host_view_only.load(Ordering::Relaxed) {
+                shared.note(true, format!("«{name}» не передан: билет для просмотра не даёт передавать файлы"));
+                repaint();
+                continue;
+            }
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            *shared.transfer.lock().unwrap() = Some((name.clone(), 0, size));
+            repaint();
+            let result = super::send_file(&conn, &path, |sent| {
+                if let Some(t) = shared.transfer.lock().unwrap().as_mut() {
+                    t.1 = sent;
+                }
+                repaint();
+            })
+            .await;
+            *shared.transfer.lock().unwrap() = None;
+            if let Err(e) = result {
+                shared.note(true, format!("«{name}» не передан: {e:#}"));
+            }
+            repaint();
+        }
+        anyhow::Ok(())
+    };
     let stats = async {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.tick().await;
@@ -170,7 +255,7 @@ pub async fn run(
             let frames = shared.assembled.swap(0, Ordering::Relaxed);
             let lost = shared.lost.swap(0, Ordering::Relaxed);
             let decoded = shared.decoded.swap(0, Ordering::Relaxed);
-            let audio = if shared.audio_packets.swap(0, Ordering::Relaxed) > 0 { " · 🔊" } else { "" };
+            let audio = if shared.audio_packets.swap(0, Ordering::Relaxed) > 0 { " · звук" } else { "" };
             let _ = out_tx.send(ClientMsg::Stats { frames, lost });
             let loss = if frames + lost > 0 { lost * 100 / (frames + lost) } else { 0 };
             *shared.status.lock().unwrap() = format!(
@@ -186,6 +271,7 @@ pub async fn run(
         r = receive => r,
         r = transmit => r,
         r = host_messages => r,
+        _ = send_files => Ok(()),
         _ = stats => Ok(()),
         e = conn.closed() => Err(anyhow::anyhow!("соединение закрыто: {e}")),
     }
@@ -197,14 +283,17 @@ fn decode_loop(
     out_tx: mpsc::UnboundedSender<ClientMsg>,
     resync: Arc<AtomicBool>,
     repaint: Repaint,
+    codec: Codec,
     (width, height): (u32, u32),
 ) {
     // PANDA_DECODER=sw forces the software decoder (diagnostics).
     let allow_hw = std::env::var("PANDA_DECODER").map_or(true, |v| v != "sw");
-    let mut decoder = match decoder::create(width, height, allow_hw) {
+    let mut decoder = match decoder::create(codec, width, height, allow_hw) {
         Ok(d) => d,
         Err(e) => {
-            tracing::error!("H.264 decoder init failed: {e:#}");
+            tracing::error!(codec = codec.name(), "decoder init failed: {e:#}");
+            // The status line is rebuilt every second from this field, so the reason stays visible.
+            *shared.decoder.lock().unwrap() = format!("{} не запустился: {e:#}", codec.name());
             return;
         }
     };

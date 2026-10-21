@@ -1,6 +1,7 @@
 //! On-screen drawing for the remote user: a transparent, click-through, topmost window covering the
 //! primary monitor, rendered with tiny-skia and composited by Windows (`UpdateLayeredWindow`).
 //! The window is excluded from screen capture, because the viewer already draws the same strokes itself.
+//! It also shows short notes from the viewer ("сеанс записывается", a typed message) at the top.
 
 use std::{
     sync::mpsc,
@@ -23,8 +24,19 @@ use windows::{
 
 use crate::media::annotate::{DrawEvent, Ink, STROKE_WIDTH};
 
+/// What the overlay shows.
+pub enum Overlay {
+    Draw(DrawEvent),
+    /// A note at the top of the screen for a few seconds.
+    Note(String),
+}
+
+/// How long a note stays, and its fade-out at the end.
+const NOTE_TIME: Duration = Duration::from_secs(6);
+const NOTE_FADE: Duration = Duration::from_millis(600);
+
 /// Starts the overlay thread; it lives until the sender is dropped.
-pub fn spawn() -> mpsc::Sender<DrawEvent> {
+pub fn spawn() -> mpsc::Sender<Overlay> {
     let (tx, rx) = mpsc::channel();
     let _ = std::thread::Builder::new().name("overlay".into()).spawn(move || {
         if let Err(e) = run(rx) {
@@ -207,31 +219,126 @@ fn render(ink: &Ink, now: Instant, pixmap: &mut Pixmap) {
     }
 }
 
-fn run(rx: mpsc::Receiver<DrawEvent>) -> anyhow::Result<()> {
+fn run(rx: mpsc::Receiver<Overlay>) -> anyhow::Result<()> {
     let mut surface = Surface::new()?;
     let mut pixmap =
         Pixmap::new(surface.width as u32, surface.height as u32).ok_or_else(|| anyhow::anyhow!("pixmap"))?;
     let mut ink = Ink::default();
+    let font = load_font();
+    let mut note: Option<(String, Instant)> = None;
     let mut shown = false;
     loop {
         surface.pump_messages();
         // Animate at ~60 fps while something is visible; otherwise sleep until the next event.
         let first = if shown { rx.recv_timeout(Duration::from_millis(16)) } else { rx.recv().map_err(Into::into) };
         let now = Instant::now();
+        let mut apply = |cmd: Overlay| match cmd {
+            Overlay::Draw(ev) => ink.apply(&ev, now),
+            Overlay::Note(text) => note = Some((text, now)),
+        };
         match first {
-            Ok(ev) => ink.apply(&ev, now),
+            Ok(cmd) => apply(cmd),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        while let Ok(ev) = rx.try_recv() {
-            ink.apply(&ev, now);
+        while let Ok(cmd) = rx.try_recv() {
+            apply(cmd);
         }
-        let visible = ink.prune(now);
+        if note.as_ref().is_some_and(|(_, at)| now.duration_since(*at) > NOTE_TIME) {
+            note = None;
+        }
+        let visible = ink.prune(now) | note.is_some();
         if visible || shown {
             render(&ink, now, &mut pixmap);
+            if let (Some((text, at)), Some(font)) = (&note, &font) {
+                let left = NOTE_TIME.saturating_sub(now.duration_since(*at));
+                let alpha = (left.as_secs_f32() / NOTE_FADE.as_secs_f32()).min(1.0);
+                draw_note(&mut pixmap, font, text, alpha);
+            }
             surface.present(&pixmap);
         }
         shown = visible;
     }
     Ok(())
+}
+
+fn load_font() -> Option<ab_glyph::FontVec> {
+    let dir =
+        std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts");
+    ["seguisb.ttf", "segoeui.ttf", "arial.ttf"]
+        .iter()
+        .find_map(|f| ab_glyph::FontVec::try_from_vec(std::fs::read(dir.join(f)).ok()?).ok())
+}
+
+/// A dark rounded box with white text, centred near the top of the screen.
+fn draw_note(pixmap: &mut Pixmap, font: &ab_glyph::FontVec, text: &str, alpha: f32) {
+    use ab_glyph::{Font, PxScale, ScaleFont, point};
+    let scale = PxScale::from((pixmap.height() as f32 / 42.0).clamp(18.0, 34.0));
+    let sf = font.as_scaled(scale);
+    let text: String = text.chars().take(160).collect();
+    let mut glyphs = Vec::new();
+    let mut x = 0.0f32;
+    let mut prev = None;
+    for c in text.chars() {
+        let id = sf.glyph_id(c);
+        if let Some(p) = prev {
+            x += sf.kern(p, id);
+        }
+        glyphs.push(id.with_scale_and_position(scale, point(x, sf.ascent())));
+        x += sf.h_advance(id);
+        prev = Some(id);
+    }
+    let (tw, th) = (x.ceil(), (sf.ascent() - sf.descent()).ceil());
+    let pad = th * 0.6;
+    let (bw, bh) = (tw + pad * 2.0, th + pad * 1.4);
+    let (bx, by) = ((pixmap.width() as f32 - bw) / 2.0, pixmap.height() as f32 * 0.06);
+    let mut paint = Paint { anti_alias: true, ..Default::default() };
+    paint.set_color_rgba8(14, 16, 20, (alpha * 225.0) as u8);
+    if let Some(rect) = tiny_skia::Rect::from_xywh(bx, by, bw, bh) {
+        let r = bh / 2.0;
+        let mut pb = PathBuilder::new();
+        pb.push_rect(rect);
+        let path = rounded_rect(bx, by, bw, bh, r).or_else(|| pb.finish());
+        if let Some(path) = path {
+            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        }
+    }
+    let (ox, oy) = (bx + pad, by + pad * 0.7);
+    let (w, h) = (pixmap.width() as i32, pixmap.height() as i32);
+    let data = pixmap.data_mut();
+    for g in glyphs {
+        let Some(outlined) = font.outline_glyph(g) else { continue };
+        let bounds = outlined.px_bounds();
+        outlined.draw(|gx, gy, coverage| {
+            let px = (ox + bounds.min.x) as i32 + gx as i32;
+            let py = (oy + bounds.min.y) as i32 + gy as i32;
+            if px < 0 || py < 0 || px >= w || py >= h {
+                return;
+            }
+            let a = (coverage * alpha).clamp(0.0, 1.0);
+            let i = ((py * w + px) * 4) as usize;
+            // Premultiplied "source over" of white.
+            for c in 0..4 {
+                let dst = data[i + c] as f32;
+                data[i + c] = (255.0 * a + dst * (1.0 - a)).round() as u8;
+            }
+        });
+    }
+}
+
+fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+    let r = r.min(w / 2.0).min(h / 2.0);
+    let k = 0.552_284_8 * r;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
 }

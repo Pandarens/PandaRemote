@@ -9,10 +9,42 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Single ALPN; the stream profile is chosen in [`ClientMsg::Hello`].
 pub const ALPN: &[u8] = b"panda-rc/2";
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 /// Presence check: the host completes the handshake and closes, nothing else (no auth, no data).
 pub const PING_ALPN: &[u8] = b"panda-rc/ping";
 const MAX_FRAME: usize = 32 * 1024 * 1024;
+
+/// Video codec of the stream. Newer codecs need fewer bits for the same picture, but both sides need
+/// hardware (or system) support for them, so the client lists what it decodes and the host picks.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Codec {
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl Codec {
+    pub fn name(self) -> &'static str {
+        match self {
+            Codec::H264 => "H.264",
+            Codec::Hevc => "HEVC",
+            Codec::Av1 => "AV1",
+        }
+    }
+
+    /// Best first: the order the host tries them in. AV1 is left out: on the hardware tested, its encoder is
+    /// too slow for live video (45 ms per 1080p frame) and its output did not decode with Windows' decoder.
+    pub const PREFERENCE: [Codec; 2] = [Codec::Hevc, Codec::H264];
+
+    pub fn parse(s: &str) -> Option<Codec> {
+        match s.to_ascii_lowercase().as_str() {
+            "h264" | "h.264" | "avc" => Some(Codec::H264),
+            "hevc" | "h265" | "h.265" => Some(Codec::Hevc),
+            "av1" => Some(Codec::Av1),
+            _ => None,
+        }
+    }
+}
 
 /// Streaming profile: picks frame rate, bitrate range and input model.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,12 +53,14 @@ pub enum Profile {
     Desktop,
     /// Games: 60 fps, adaptive high bitrate, relative mouse, scancodes, gamepad.
     Game,
+    /// No picture: one-off requests (e.g. Wake-on-LAN) after authentication.
+    Control,
 }
 
 impl Profile {
     pub fn fps(self) -> u32 {
         match self {
-            Profile::Desktop => 30,
+            Profile::Desktop | Profile::Control => 30,
             Profile::Game => 60,
         }
     }
@@ -34,7 +68,7 @@ impl Profile {
     /// (start, min, max) bitrate in bits per second.
     pub fn bitrate(self) -> (u32, u32, u32) {
         match self {
-            Profile::Desktop => (8_000_000, 2_000_000, 15_000_000),
+            Profile::Desktop | Profile::Control => (8_000_000, 2_000_000, 15_000_000),
             Profile::Game => (20_000_000, 5_000_000, 50_000_000),
         }
     }
@@ -43,6 +77,7 @@ impl Profile {
         match self {
             Profile::Desktop => "desktop",
             Profile::Game => "game",
+            Profile::Control => "control",
         }
     }
 }
@@ -55,6 +90,8 @@ pub enum ClientMsg {
         profile: Profile,
         /// Which monitor to stream (index into `StreamInfo::monitors`); `None` = the primary one.
         monitor: Option<u8>,
+        /// Codecs the viewer can decode; the host streams the best one it can encode.
+        codecs: Vec<Codec>,
     },
     Auth {
         mac: [u8; 32],
@@ -73,7 +110,26 @@ pub enum ClientMsg {
     Pin(String),
     /// Press Ctrl+Alt+Del on the host (works when the Windows service is installed).
     SecureAttention,
+    /// Text the viewer copied; the host puts it on its clipboard.
+    Clipboard(String),
+    /// A short note shown on the host's screen for a few seconds.
+    Message(String),
+    /// Control profile: send a Wake-on-LAN packet for `mac` on this host's networks.
+    Wake {
+        mac: [u8; 6],
+    },
 }
+
+/// First message on a unidirectional stream the viewer opens to send a file; the file's bytes follow.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FileHeader {
+    pub name: String,
+    pub size: u64,
+}
+
+/// Largest file accepted, and the largest clipboard text synced.
+pub const MAX_FILE: u64 = 4 * 1024 * 1024 * 1024;
+pub const MAX_CLIPBOARD: usize = 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum HostMsg {
@@ -99,6 +155,11 @@ pub enum HostMsg {
         monitors: Vec<String>,
         /// Index of the streamed one in `monitors`.
         monitor: u8,
+        codec: Codec,
+        /// The viewer came with the view-only ticket: input, clipboard and files are ignored.
+        view_only: bool,
+        /// The host's network card addresses, so it can be woken over the LAN later.
+        macs: Vec<[u8; 6]>,
     },
     /// Force feedback the game set on the virtual controller (0 = off).
     Rumble {
@@ -107,6 +168,15 @@ pub enum HostMsg {
     },
     /// The host shows the lock screen / a UAC prompt (a secure desktop) or is back on the normal desktop.
     SecureDesktop(bool),
+    /// Text copied on the host.
+    Clipboard(String),
+    /// A file the viewer sent: where it was saved, or why not.
+    FileSaved {
+        name: String,
+        result: Result<String, String>,
+    },
+    /// Answer to a control-profile request.
+    Done(Result<(), String>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

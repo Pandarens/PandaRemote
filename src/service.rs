@@ -301,6 +301,12 @@ pub fn sync_user_copy(to: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Creates the service's view-only ticket secret if needed and refreshes the user's copy in `to`.
+pub fn create_view_ticket(to: &std::path::Path) -> Result<()> {
+    config::HostConfig::load_or_create()?.ensure_view_secret()?;
+    sync_user_copy(to)
+}
+
 /// Sets the service's PIN from `pin_file` (empty: no PIN), deletes the file and refreshes the copy in `to`.
 pub fn set_pin(pin_file: &std::path::Path, to: &std::path::Path) -> Result<()> {
     let pin = std::fs::read_to_string(pin_file).with_context(|| format!("read {}", pin_file.display()));

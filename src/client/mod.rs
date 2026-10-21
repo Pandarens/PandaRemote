@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod decoder;
 pub mod gamepad;
+pub mod record;
 pub mod viewer;
 
 use std::time::Duration;
@@ -16,7 +17,7 @@ use tokio::sync::OnceCell;
 
 use crate::{
     config,
-    proto::{self, ClientMsg, HostMsg, PROTOCOL_VERSION, Profile},
+    proto::{self, ClientMsg, Codec, HostMsg, PROTOCOL_VERSION, Profile},
     ticket::Ticket,
 };
 
@@ -48,7 +49,14 @@ impl std::fmt::Display for PinError {
 
 impl std::error::Error for PinError {}
 
-pub async fn connect(ticket: &Ticket, profile: Profile, pin: Option<&str>, monitor: Option<u8>) -> Result<Session> {
+/// Opens a session. `codecs`: what this viewer decodes (see [`decoder::supported`]).
+pub async fn connect(
+    ticket: &Ticket,
+    profile: Profile,
+    pin: Option<&str>,
+    monitor: Option<u8>,
+    codecs: &[Codec],
+) -> Result<Session> {
     let ep = endpoint().await?;
     let conn = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(ticket.host_id, proto::ALPN))
         .await
@@ -56,7 +64,13 @@ pub async fn connect(ticket: &Ticket, profile: Profile, pin: Option<&str>, monit
         .context("не удалось соединиться с хостом")?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
-    let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, client_name: config::machine_name(), profile, monitor };
+    let hello = ClientMsg::Hello {
+        version: PROTOCOL_VERSION,
+        client_name: config::machine_name(),
+        profile,
+        monitor,
+        codecs: codecs.to_vec(),
+    };
     proto::write_msg(&mut send, &hello).await?;
     let HostMsg::Challenge { nonce, host_name } = proto::read_msg(&mut recv).await? else {
         bail!("unexpected message from host");
@@ -81,6 +95,50 @@ pub async fn connect(ticket: &Ticket, profile: Profile, pin: Option<&str>, monit
         _ => bail!("unexpected message from host"),
     }
     Ok(Session { conn, send, recv, host_name })
+}
+
+/// Asks the PC behind `via` to send a Wake-on-LAN packet for each of `macs` on its network.
+pub async fn wake(via: &Ticket, pin: Option<&str>, macs: &[[u8; 6]]) -> Result<()> {
+    anyhow::ensure!(
+        !macs.is_empty(),
+        "адрес сетевой карты этого ПК неизвестен: подключитесь к нему один раз, когда он включён"
+    );
+    for mac in macs {
+        let Session { conn, mut send, mut recv, .. } = connect(via, Profile::Control, pin, None, &[]).await?;
+        proto::write_msg(&mut send, &ClientMsg::Wake { mac: *mac }).await?;
+        let reply = proto::read_msg::<HostMsg>(&mut recv).await?;
+        conn.close(0u32.into(), b"bye");
+        match reply {
+            HostMsg::Done(Ok(())) => {}
+            HostMsg::Done(Err(e)) => bail!("{e}"),
+            _ => bail!("unexpected answer"),
+        }
+    }
+    Ok(())
+}
+
+/// Sends a file on its own stream; `progress(sent)` is called as it goes.
+pub async fn send_file(conn: &Connection, path: &std::path::Path, progress: impl Fn(u64)) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await.with_context(|| format!("open {}", path.display()))?;
+    let size = file.metadata().await?.len();
+    anyhow::ensure!(size <= proto::MAX_FILE, "файл больше {} ГБ", proto::MAX_FILE >> 30);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "файл".into());
+    let mut send = conn.open_uni().await?;
+    proto::write_msg(&mut send, &proto::FileHeader { name, size }).await?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut sent = 0u64;
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        send.write_all(&buf[..n]).await?;
+        sent += n as u64;
+        progress(sent);
+    }
+    send.finish()?;
+    Ok(())
 }
 
 /// Closes the process-wide endpoint gracefully, so hosts see the disconnect at once instead of after

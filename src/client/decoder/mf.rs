@@ -25,6 +25,7 @@ use windows::{
 
 use super::VideoDecoder;
 use crate::client::viewer::VideoFrame;
+use crate::proto::Codec;
 
 struct Gpu {
     /// Kept alive for the decoder's lifetime.
@@ -47,12 +48,12 @@ pub struct MfDecoder {
 }
 
 impl MfDecoder {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    pub fn new(codec: Codec, width: u32, height: u32) -> Result<Self> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).context("MFStartup")?;
         }
-        let (transform, mut name) = activate_decoder()?;
+        let (transform, mut name) = activate_decoder(codec)?;
         let attrs = unsafe { transform.GetAttributes()? };
         unsafe {
             let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
@@ -84,7 +85,7 @@ impl MfDecoder {
         unsafe {
             let input = MFCreateMediaType()?;
             input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            input.SetGUID(&MF_MT_SUBTYPE, &subtype(codec))?;
             input.SetUINT64(&MF_MT_FRAME_SIZE, ((width as u64) << 32) | height as u64)?;
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             transform.SetInputType(0, &input, 0).context("SetInputType")?;
@@ -95,7 +96,7 @@ impl MfDecoder {
             decoder.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             decoder.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
-        tracing::info!(decoder = %decoder.name, "H.264 decoder ready");
+        tracing::info!(decoder = %decoder.name, codec = codec.name(), "decoder ready");
         Ok(decoder)
     }
 
@@ -295,8 +296,81 @@ fn create_gpu() -> Result<Gpu> {
     }
 }
 
-fn activate_decoder() -> Result<(IMFTransform, String)> {
-    let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+fn subtype(codec: Codec) -> GUID {
+    match codec {
+        Codec::H264 => MFVideoFormat_H264,
+        Codec::Hevc => MFVideoFormat_HEVC,
+        Codec::Av1 => MFVideoFormat_AV1,
+    }
+}
+
+/// Decoder MFTs for each codec: hardware ones first, then any (diagnostics).
+pub fn available() -> Vec<(Codec, String)> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    }
+    let mut out = Vec::new();
+    for codec in Codec::PREFERENCE {
+        for (flags, kind) in [(MFT_ENUM_FLAG_HARDWARE, "аппаратный"), (MFT_ENUM_FLAG_SYNCMFT, "системный")]
+        {
+            for name in enum_names(subtype(codec), flags) {
+                out.push((codec, format!("{name} ({kind})")));
+            }
+        }
+    }
+    out
+}
+
+/// Codecs worth asking the host for: H.264 always; HEVC/AV1 only with a decoder MFT present
+/// (a hardware one, or a system one that binds to the GPU through DXVA).
+pub fn supported() -> Vec<Codec> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    }
+    let mut codecs = vec![Codec::H264];
+    for codec in [Codec::Hevc, Codec::Av1] {
+        if !enum_names(subtype(codec), MFT_ENUM_FLAG_HARDWARE).is_empty()
+            || !enum_names(subtype(codec), MFT_ENUM_FLAG_SYNCMFT).is_empty()
+        {
+            codecs.push(codec);
+        }
+    }
+    codecs
+}
+
+fn enum_names(input: GUID, flags: MFT_ENUM_FLAG) -> Vec<String> {
+    let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: input };
+    let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    let mut names = Vec::new();
+    unsafe {
+        if MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            flags | MFT_ENUM_FLAG_SORTANDFILTER,
+            Some(&input),
+            None,
+            &mut list,
+            &mut count,
+        )
+        .is_err()
+            || list.is_null()
+        {
+            return names;
+        }
+        for slot in std::slice::from_raw_parts_mut(list, count as usize) {
+            if let Some(a) = slot.take() {
+                names.push(friendly_name(&a).unwrap_or_else(|| "MFT".into()));
+            }
+        }
+        CoTaskMemFree(Some(list as *const _));
+    }
+    names
+}
+
+fn activate_decoder(codec: Codec) -> Result<(IMFTransform, String)> {
+    let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype(codec) };
     let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
     unsafe {
@@ -310,10 +384,10 @@ fn activate_decoder() -> Result<(IMFTransform, String)> {
         )
         .context("MFTEnumEx")?;
         if count == 0 || list.is_null() {
-            bail!("no H.264 decoder MFT");
+            bail!("no {} decoder MFT", codec.name());
         }
         let activates = std::slice::from_raw_parts_mut(list, count as usize);
-        let mut result = Err(anyhow::anyhow!("no H.264 decoder could be activated"));
+        let mut result = Err(anyhow::anyhow!("no {} decoder could be activated", codec.name()));
         for slot in activates.iter_mut() {
             let Some(activate) = slot.take() else {
                 continue;

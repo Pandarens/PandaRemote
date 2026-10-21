@@ -1,4 +1,4 @@
-//! H.264 encoders: hardware via Media Foundation (Windows), software openh264 as fallback.
+//! Video encoders: hardware H.264/HEVC/AV1 via Media Foundation (Windows), software openh264 (H.264) as fallback.
 
 #[cfg(windows)]
 mod mf;
@@ -6,8 +6,10 @@ mod sw;
 
 use anyhow::Result;
 
+use crate::proto::Codec;
+
 pub struct EncodedFrame {
-    /// H.264 Annex B access unit.
+    /// One access unit (Annex B for H.264/HEVC, OBUs for AV1).
     pub data: Vec<u8>,
     pub keyframe: bool,
 }
@@ -28,17 +30,36 @@ pub trait VideoEncoder {
     fn set_bitrate(&mut self, bps: u32);
 }
 
-/// Hardware encoder when available, otherwise openh264.
-pub fn create(width: u32, height: u32, fps: u32, bitrate: u32, allow_hw: bool) -> Result<Box<dyn VideoEncoder>> {
+/// The best codec in `accepted` this machine can encode in hardware, with its encoder; H.264 in software
+/// (openh264) when nothing else works.
+pub fn create(
+    accepted: &[Codec],
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+    allow_hw: bool,
+) -> Result<(Codec, Box<dyn VideoEncoder>)> {
     #[cfg(windows)]
     if allow_hw {
-        match mf::MfEncoder::new(width, height, fps, bitrate) {
-            Ok(e) => return Ok(Box::new(e)),
-            Err(e) => tracing::warn!("hardware encoder unavailable, using openh264: {e:#}"),
+        for codec in Codec::PREFERENCE.into_iter().filter(|c| accepted.contains(c)) {
+            match mf::MfEncoder::new(codec, width, height, fps, bitrate) {
+                Ok(e) => return Ok((codec, Box::new(e))),
+                Err(e) => tracing::info!(codec = codec.name(), "hardware encoder unavailable: {e:#}"),
+            }
         }
+        tracing::warn!("no hardware encoder for the viewer's codecs, using openh264");
     }
-    let _ = allow_hw;
-    Ok(Box::new(sw::SwEncoder::new(width, height, fps, bitrate)?))
+    let _ = (accepted, allow_hw);
+    Ok((Codec::H264, Box::new(sw::SwEncoder::new(width, height, fps, bitrate)?)))
+}
+
+/// Codecs this machine has hardware encoders for (diagnostics).
+pub fn hardware_codecs() -> Vec<(Codec, String)> {
+    #[cfg(windows)]
+    return mf::available();
+    #[cfg(not(windows))]
+    Vec::new()
 }
 
 /// Converts 32-bit RGB(A) to NV12 (BT.601, limited range), matching the client's decoder conversion.

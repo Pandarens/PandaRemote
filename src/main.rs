@@ -12,12 +12,14 @@ mod proto;
 #[cfg(windows)]
 mod service;
 mod ticket;
+#[cfg(windows)]
+mod tray;
 mod update;
 mod yuv_render;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -48,7 +50,11 @@ enum Command {
         action: ServiceAction,
     },
     /// Показать билет подключения к этому ПК
-    Ticket,
+    Ticket {
+        /// Билет только для просмотра: экран виден, управлять нельзя
+        #[arg(long)]
+        view: bool,
+    },
     /// Задать PIN-код, который спрашивается после билета (4–8 цифр), или `off` — убрать
     Pin { pin: String },
     /// Открыть окно сеанса (рабочий стол или игра)
@@ -62,6 +68,15 @@ enum Command {
     Log,
     /// Проверить, в сети ли компьютер с этим билетом
     Ping { ticket: String },
+    /// Разбудить выключенный ПК (Wake-on-LAN) через другой ПК с Panda в той же сети
+    Wake {
+        /// Билет ПК, который отправит пакет пробуждения
+        via: String,
+        /// MAC-адрес сетевой карты спящего ПК, например 70-85-C2-0A-1B-FF
+        mac: String,
+        #[arg(long)]
+        pin: Option<String>,
+    },
     /// Проверить обновления на GitHub и установить, если есть
     Update,
     /// Выпуск: создать ключ подписи (приватный — в файл, публичный — на экран)
@@ -70,11 +85,16 @@ enum Command {
     /// Выпуск: подписать файл ключом из PANDA_SIGNING_KEY (пишет <файл>.sig)
     #[command(hide = true)]
     ReleaseSign { file: std::path::PathBuf },
-    /// Диагностика: скорость H.264-энкодера на синтетических кадрах 1080p
+    /// Какие кодеки (H.264, HEVC, AV1) этот ПК умеет кодировать и декодировать
+    Codecs,
+    /// Диагностика: скорость энкодера на синтетических кадрах 1080p
     #[command(hide = true)]
     BenchEncoder {
         #[arg(long)]
         sw: bool,
+        /// h264, hevc или av1
+        #[arg(long, default_value = "h264")]
+        codec: String,
         #[arg(long, default_value_t = 60)]
         fps: u32,
     },
@@ -93,6 +113,21 @@ enum Command {
         /// Номер монитора (с 1); без него — основной
         #[arg(long)]
         monitor: Option<u8>,
+        /// Предложить хосту только этот кодек (h264, hevc, av1); без него — всё, что декодирует этот ПК
+        #[arg(long)]
+        codec: Option<String>,
+        /// Отправить файл на удалённый ПК (в «Загрузки\Panda»)
+        #[arg(long, hide = true)]
+        send_file: Option<std::path::PathBuf>,
+        /// Показать сообщение на экране удалённого ПК
+        #[arg(long, hide = true)]
+        message: Option<String>,
+        /// Положить текст в буфер обмена удалённого ПК
+        #[arg(long, hide = true)]
+        clipboard: Option<String>,
+        /// Записать сеанс в эту папку
+        #[arg(long, hide = true)]
+        record: Option<std::path::PathBuf>,
         /// Через 2 с сдвинуть мышь хоста относительным движением и вернуть обратно (проверка ввода)
         #[arg(long, hide = true)]
         nudge: bool,
@@ -121,6 +156,14 @@ enum ServiceAction {
     #[command(hide = true)]
     SyncTicket {
         /// Папка пользователя, куда положить копию
+        #[arg(long)]
+        to: std::path::PathBuf,
+        #[arg(long, hide = true)]
+        result_file: Option<std::path::PathBuf>,
+    },
+    /// Создать билет для просмотра у службы и скопировать его в папку пользователя
+    #[command(hide = true)]
+    ViewTicket {
         #[arg(long)]
         to: std::path::PathBuf,
         #[arg(long, hide = true)]
@@ -193,10 +236,37 @@ fn main() -> Result<()> {
         Some(Command::Connect { ticket, game }) => {
             gui::run(rt, Some((ticket::Ticket::decode(&ticket)?, profile(game))), cli.minimized)
         }
-        Some(Command::Ticket) => {
-            let cfg = config::HostConfig::load_or_create().map_err(service_files_hint)?;
-            let t = ticket::Ticket { host_id: config::host_key()?.public(), secret: cfg.access_secret };
+        Some(Command::Ticket { view }) => {
+            let mut cfg = config::HostConfig::load_or_create().map_err(service_files_hint)?;
+            let secret = if view { cfg.ensure_view_secret()? } else { cfg.access_secret };
+            #[cfg(windows)]
+            if view && config::host_dir() == config::machine_dir() {
+                service::sync_user_copy(&config::user_dir())?;
+            }
+            let t = ticket::Ticket { host_id: config::host_key()?.public(), secret };
             println!("{}", t.encode());
+            Ok(())
+        }
+        Some(Command::Wake { via, mac, pin }) => rt.block_on(async {
+            let via = ticket::Ticket::decode(&via)?;
+            let mac = host::net::parse_mac(&mac).context("MAC вида 70-85-C2-0A-1B-FF")?;
+            let result = client::wake(&via, pin.as_deref(), &[mac]).await;
+            client::shutdown().await;
+            result?;
+            println!("Пакет пробуждения отправлен через {}", via.host_id.fmt_short());
+            Ok(())
+        }),
+        Some(Command::Codecs) => {
+            println!("Кодирование (аппаратное, для хоста):");
+            for (codec, name) in host::encoder::hardware_codecs() {
+                println!("  {:6} {name}", codec.name());
+            }
+            println!("Декодирование (для клиента):");
+            for (codec, name) in client::decoder::decoder_names() {
+                println!("  {:6} {name}", codec.name());
+            }
+            let ok: Vec<_> = client::decoder::supported().into_iter().map(|c| c.name()).collect();
+            println!("Клиент попросит: {}", ok.join(", "));
             Ok(())
         }
         Some(Command::Pin { pin }) => {
@@ -276,6 +346,9 @@ fn main() -> Result<()> {
             ServiceAction::SyncTicket { to, result_file } => {
                 service::report(result_file, service::sync_user_copy(&to), || {})
             }
+            ServiceAction::ViewTicket { to, result_file } => {
+                service::report(result_file, service::create_view_ticket(&to), || {})
+            }
             ServiceAction::SetPin { pin_file, to, result_file } => {
                 service::report(result_file, service::set_pin(&pin_file, &to), || println!("PIN-код службы обновлён."))
             }
@@ -318,12 +391,32 @@ fn main() -> Result<()> {
             host.shutdown().await;
             Ok(())
         }),
-        Some(Command::BenchEncoder { sw, fps }) => bench_encoder(!sw, fps),
-        Some(Command::Probe { ticket, out, seconds, game, pin, monitor, nudge, actions }) => rt.block_on(async {
+        Some(Command::BenchEncoder { sw, fps, codec }) => {
+            bench_encoder(!sw, fps, proto::Codec::parse(&codec).context("кодек: h264, hevc или av1")?)
+        }
+        Some(Command::Probe {
+            ticket,
+            out,
+            seconds,
+            game,
+            pin,
+            monitor,
+            codec,
+            send_file,
+            message,
+            clipboard,
+            record,
+            nudge,
+            actions,
+        }) => rt.block_on(async {
             let ticket = ticket::Ticket::decode(&ticket)?;
             let started = std::time::Instant::now();
-            let session =
-                client::connect(&ticket, profile(game), pin.as_deref(), monitor.map(|m| m.saturating_sub(1))).await?;
+            let codecs = match codec {
+                Some(c) => vec![proto::Codec::parse(&c).context("кодек: h264, hevc или av1")?],
+                None => client::decoder::supported(),
+            };
+            let monitor = monitor.map(|m| m.saturating_sub(1));
+            let session = client::connect(&ticket, profile(game), pin.as_deref(), monitor, &codecs).await?;
             println!(
                 "Подключено к «{}» за {:?} ({})",
                 session.host_name,
@@ -389,9 +482,54 @@ fn main() -> Result<()> {
                     }
                 });
             }
-            let run = client::viewer::run(session, shared.clone(), tx, rx, repaint, false);
+            let (files_tx, files_rx) = tokio::sync::mpsc::unbounded_channel();
+            if let Some(path) = send_file {
+                let _ = files_tx.send(path);
+            }
+            if let Some(text) = message {
+                let _ = tx.send(proto::ClientMsg::Message(text));
+            }
+            if let Some(text) = clipboard {
+                let _ = tx.send(proto::ClientMsg::Clipboard(text));
+            }
+            if let Some(dir) = record.clone() {
+                let (shared, tx) = (shared.clone(), tx.clone());
+                tokio::spawn(async move {
+                    // Wait for the stream's codec and size, then record from the next keyframe.
+                    for _ in 0..50 {
+                        if let Some((codec, w, h)) = *shared.stream.lock().unwrap() {
+                            match client::record::Recorder::start(&dir, "probe", codec, w, h) {
+                                Ok(r) => *shared.recorder.lock().unwrap() = Some(r),
+                                Err(e) => println!("Запись: {e:#}"),
+                            }
+                            let _ = tx.send(proto::ClientMsg::RequestKeyframe);
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                });
+            }
+            let run = client::viewer::run(session, shared.clone(), tx, rx, files_rx, repaint, false);
             let _ = tokio::time::timeout(std::time::Duration::from_secs(seconds), run).await;
             client::shutdown().await;
+            drop(files_tx);
+            if let Some((codec, w, h)) = *shared.stream.lock().unwrap() {
+                println!("Кодек: {} {w}x{h}", codec.name());
+            }
+            if let Some(rec) = shared.recorder.lock().unwrap().take() {
+                match rec.finish() {
+                    Ok(path) => println!("Запись: {}", path.display()),
+                    Err(e) => println!("Запись не сохранена: {e:#}"),
+                }
+            }
+            for (_, error, text) in shared.notes.lock().unwrap().iter() {
+                println!("{}{text}", if *error { "Ошибка: " } else { "" });
+            }
+            if let Some(text) = shared.remote_clipboard.lock().unwrap().as_deref() {
+                println!("Буфер обмена хоста: {} символов", text.chars().count());
+            }
+            let macs: Vec<_> = shared.macs.lock().unwrap().iter().map(host::net::format_mac).collect();
+            println!("MAC хоста: {}", macs.join(", "));
             let frame = shared.frame.lock().unwrap().take();
             if frame.is_none() {
                 println!("Статус без кадров: {}", shared.status.lock().unwrap());
@@ -438,12 +576,19 @@ fn profile(game: bool) -> proto::Profile {
     if game { proto::Profile::Game } else { proto::Profile::Desktop }
 }
 
-fn bench_encoder(hw: bool, fps: u32) -> Result<()> {
+fn bench_encoder(hw: bool, fps: u32, codec: proto::Codec) -> Result<()> {
     use host::encoder::{self, Picture};
     let (w, h) = (1920u32, 1080u32);
-    let mut enc = encoder::create(w, h, fps, 20_000_000, hw)?;
-    println!("Энкодер: {}", enc.name());
-    let mut decoders = [client::decoder::create(w, h, true)?, client::decoder::create(w, h, false)?];
+    let (codec, mut enc) = encoder::create(&[codec], w, h, fps, 20_000_000, hw)?;
+    println!("Энкодер: {} ({})", enc.name(), codec.name());
+    // No decoder on this PC (e.g. HEVC without Windows' extension): measure the encoder alone.
+    let mut decoders: Vec<_> = client::decoder::create(codec, w, h, true)
+        .map_err(|e| println!("Декодер {}: нет ({e:#})", codec.name()))
+        .into_iter()
+        .collect();
+    if codec == proto::Codec::H264 {
+        decoders.push(client::decoder::create(codec, w, h, false)?);
+    }
     let mut decode_times = [std::time::Duration::ZERO; 2];
     let mut decoded_counts = [0u32; 2];
     let mut decode_cpu = [std::time::Duration::ZERO; 2];

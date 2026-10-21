@@ -3,13 +3,16 @@
 
 mod audio;
 mod capture;
+mod clipboard;
 #[cfg(windows)]
 pub mod desktop_switch;
 #[cfg(windows)]
 mod dxgi;
 pub mod encoder;
+mod files;
 mod gamepad;
 mod input;
+pub mod net;
 #[cfg(windows)]
 mod overlay;
 mod session;
@@ -28,7 +31,7 @@ use iroh::{
 
 use crate::{
     config::{self, HostConfig, PinHash},
-    proto::{self, ClientMsg, HostMsg, PROTOCOL_VERSION},
+    proto::{self, ClientMsg, HostMsg, PROTOCOL_VERSION, Profile},
     ticket::Ticket,
 };
 
@@ -61,6 +64,22 @@ impl Host {
 
     pub async fn shutdown(self) {
         let _ = self.router.shutdown().await;
+    }
+}
+
+/// One request on a control connection (no picture): Wake-on-LAN for a PC on this host's network.
+async fn control(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    view_only: bool,
+) -> Result<(), String> {
+    let _ = send;
+    if view_only {
+        return Err("билет для просмотра не даёт управлять этим ПК".into());
+    }
+    match proto::read_msg::<ClientMsg>(recv).await.map_err(|e| format!("{e:#}"))? {
+        ClientMsg::Wake { mac } => net::wake(mac).map_err(|e| format!("{e:#}")),
+        other => Err(format!("неожиданный запрос: {other:?}")),
     }
 }
 
@@ -139,7 +158,8 @@ impl Handler {
         let cid = client_id.to_string();
         let (mut send, mut recv) = conn.accept_bi().await?;
 
-        let ClientMsg::Hello { version, client_name, profile, monitor } = proto::read_msg(&mut recv).await? else {
+        let ClientMsg::Hello { version, client_name, profile, monitor, codecs } = proto::read_msg(&mut recv).await?
+        else {
             bail!("expected Hello");
         };
         let nonce = config::random_bytes();
@@ -148,9 +168,15 @@ impl Handler {
             bail!("expected Auth");
         };
 
-        let expected = proto::auth_mac(&self.cfg.access_secret, &nonce, client_id, self.id);
-        // blake3::Hash equality is constant-time.
-        let mut reject = if expected != blake3::Hash::from_bytes(mac) {
+        let mac = blake3::Hash::from_bytes(mac);
+        // blake3::Hash equality is constant-time. Secrets are re-read, so a view-only ticket made after
+        // the host started works at once.
+        let current = HostConfig::load().ok().flatten();
+        let full = current.as_ref().map_or(self.cfg.access_secret, |c| c.access_secret);
+        let view = current.as_ref().and_then(|c| c.view_secret);
+        let view_only = view.is_some_and(|v| proto::auth_mac(&v, &nonce, client_id, self.id) == mac);
+        let full_ok = proto::auth_mac(&full, &nonce, client_id, self.id) == mac;
+        let mut reject = if !full_ok && !view_only {
             Some("неверный ключ доступа".to_string())
         } else if version != PROTOCOL_VERSION {
             Some("несовместимая версия протокола".to_string())
@@ -158,7 +184,7 @@ impl Handler {
             None
         };
         // Re-read on every connection, so a new PIN applies without restarting the host.
-        let pin = HostConfig::load().ok().flatten().and_then(|c| c.pin);
+        let pin = current.and_then(|c| c.pin);
         if reject.is_none()
             && let Some(pin) = pin
         {
@@ -178,10 +204,23 @@ impl Handler {
         }
         proto::write_msg(&mut send, &HostMsg::AuthResult { ok: true, reason: String::new() }).await?;
 
-        let kind_name = profile.name();
+        if profile == Profile::Control {
+            let result = control(&mut send, &mut recv, view_only).await;
+            config::journal(
+                &cid,
+                &client_name,
+                "control",
+                &result.as_ref().err().cloned().unwrap_or_else(|| "ok".into()),
+            );
+            proto::write_msg(&mut send, &HostMsg::Done(result)).await?;
+            send.finish()?;
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
+            return Ok(());
+        }
+        let kind_name = if view_only { "view" } else { profile.name() };
         config::journal(&cid, &client_name, "connected", kind_name);
         let started = Instant::now();
-        let result = session::serve(&conn, profile, monitor, send, recv).await;
+        let result = session::serve(&conn, profile, monitor, codecs, view_only, send, recv).await;
         let detail = match &result {
             Ok(()) => format!("{kind_name}, {} с", started.elapsed().as_secs()),
             Err(e) => format!("{kind_name}, {} с, {e:#}", started.elapsed().as_secs()),

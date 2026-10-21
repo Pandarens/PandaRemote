@@ -1,4 +1,4 @@
-//! H.264 decoders: hardware (DXVA) via Media Foundation on Windows, openh264 as fallback.
+//! Video decoders: Media Foundation (DXVA when possible) for H.264/HEVC/AV1 on Windows, openh264 (H.264) as fallback.
 
 #[cfg(windows)]
 mod mf;
@@ -7,6 +7,7 @@ mod sw;
 use anyhow::Result;
 
 use super::viewer::VideoFrame;
+use crate::proto::Codec;
 
 pub trait VideoDecoder {
     fn name(&self) -> String;
@@ -14,17 +15,37 @@ pub trait VideoDecoder {
     fn decode(&mut self, au: &[u8]) -> Result<Option<VideoFrame>>;
 }
 
-/// Hardware decoder when available, otherwise openh264. `width`/`height` are the stream's picture size.
-pub fn create(width: u32, height: u32, allow_hw: bool) -> Result<Box<dyn VideoDecoder>> {
+/// Media Foundation decoder when available, otherwise openh264 (H.264 only).
+/// `width`/`height` are the stream's picture size.
+pub fn create(codec: Codec, width: u32, height: u32, allow_hw: bool) -> Result<Box<dyn VideoDecoder>> {
     #[cfg(windows)]
-    if allow_hw {
-        match mf::MfDecoder::new(width, height) {
+    if allow_hw || codec != Codec::H264 {
+        match mf::MfDecoder::new(codec, width, height) {
             Ok(d) => return Ok(Box::new(d)),
-            Err(e) => tracing::warn!("hardware decoder unavailable, using openh264: {e:#}"),
+            Err(e) if codec == Codec::H264 => tracing::warn!("hardware decoder unavailable, using openh264: {e:#}"),
+            Err(e) => return Err(e),
         }
     }
+    anyhow::ensure!(codec == Codec::H264, "no {} decoder", codec.name());
     let _ = (width, height, allow_hw);
     Ok(Box::new(sw::SwDecoder::new()?))
+}
+
+/// Codecs this machine can decode with hardware acceleration (H.264 always works, in software at worst).
+/// HEVC and AV1 need the GPU and, for HEVC, Windows' "HEVC Video Extensions".
+pub fn supported() -> Vec<Codec> {
+    #[cfg(windows)]
+    return mf::supported();
+    #[cfg(not(windows))]
+    vec![Codec::H264]
+}
+
+/// Decoders present for each codec (diagnostics).
+pub fn decoder_names() -> Vec<(Codec, String)> {
+    #[cfg(windows)]
+    return mf::available();
+    #[cfg(not(windows))]
+    Vec::new()
 }
 
 /// NV12 (BT.601 limited range, as produced by our encoders) to RGBA.
