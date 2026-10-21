@@ -25,6 +25,19 @@ pub fn spawn() -> mpsc::Sender<InputEvent> {
 struct Injector {
     keys: HashSet<(u16, bool)>,
     buttons: HashSet<u8>,
+    #[cfg(windows)]
+    desktop: Desktop,
+}
+
+/// Input must be injected from a thread on the desktop that currently has input (lock screen, UAC).
+#[cfg(windows)]
+struct Desktop(super::desktop_switch::DesktopFollower);
+
+#[cfg(windows)]
+impl Default for Desktop {
+    fn default() -> Self {
+        Desktop(super::desktop_switch::DesktopFollower::new())
+    }
 }
 
 #[cfg(not(windows))]
@@ -81,6 +94,7 @@ mod win {
 impl Injector {
     fn apply(&mut self, ev: InputEvent) {
         use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        self.desktop.0.check();
         match ev {
             InputEvent::MouseMove { x, y } => {
                 // 0..65535 over the primary monitor is exactly MOUSEEVENTF_ABSOLUTE's coordinate space.
@@ -131,12 +145,16 @@ impl Injector {
             InputEvent::Text(text) => {
                 let inputs: Vec<INPUT> = text
                     .encode_utf16()
-                    .flat_map(|u| [win::key(0, u, KEYEVENTF_UNICODE), win::key(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)])
+                    .flat_map(|u| {
+                        [win::key(0, u, KEYEVENTF_UNICODE), win::key(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)]
+                    })
                     .collect();
                 win::send(&inputs);
             }
             InputEvent::Key { key, down, mods } => {
-                let Some((vk, extended)) = vk_of(key) else { return };
+                let Some((vk, extended)) = vk_of(key) else {
+                    return;
+                };
                 let mut seq = Vec::new();
                 let vk_event = |vk: u16, extended: bool, up: bool| {
                     let mut flags = KEYBD_EVENT_FLAGS(0);

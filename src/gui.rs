@@ -25,9 +25,7 @@ use crate::{
 
 pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>) -> Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Panda Remote")
-            .with_inner_size([1100.0, 720.0]),
+        viewport: egui::ViewportBuilder::default().with_title("Panda Remote").with_inner_size([1100.0, 720.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -214,7 +212,13 @@ impl App {
         let game = (profile == Profile::Game).then(|| {
             let pad_stop = Arc::new(AtomicBool::new(false));
             *shared.rumble.lock().unwrap() = Some(gamepad::spawn(out_tx.clone(), pad_stop.clone()));
-            GameInput { captured: false, mods: egui::Modifiers::default(), pressed: HashSet::new(), motion: Vec2::ZERO, pad_stop }
+            GameInput {
+                captured: false,
+                mods: egui::Modifiers::default(),
+                pressed: HashSet::new(),
+                motion: Vec2::ZERO,
+                pad_stop,
+            }
         });
         self.message = None;
         self.desktop = Some(DesktopView {
@@ -274,7 +278,9 @@ impl App {
                 ui.label(egui::RichText::new(&h.name).strong());
                 let id = Ticket::decode(&h.ticket).map(|t| t.host_id.fmt_short().to_string()).unwrap_or_default();
                 ui.label(egui::RichText::new(id).monospace().weak());
-                ui.label(h.last_connected.as_deref().map(|t| format!("был: {}", &t[..16.min(t.len())])).unwrap_or_default());
+                ui.label(
+                    h.last_connected.as_deref().map(|t| format!("был: {}", &t[..16.min(t.len())])).unwrap_or_default(),
+                );
                 if ui.button("🖥 Рабочий стол").clicked() {
                     action = Some((i, "desktop"));
                 }
@@ -304,12 +310,22 @@ impl App {
         ui.label(egui::RichText::new("Добавить компьютер").strong());
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.new_name).hint_text("Название").desired_width(160.0));
-            ui.add(egui::TextEdit::singleline(&mut self.new_ticket).hint_text("Билет panda1…").desired_width(480.0).password(true));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_ticket)
+                    .hint_text("Билет panda1…")
+                    .desired_width(480.0)
+                    .password(true),
+            );
             if ui.button("Добавить").clicked() {
                 match Ticket::decode(&self.new_ticket) {
                     Ok(t) => {
-                        let name = if self.new_name.trim().is_empty() { t.host_id.fmt_short().to_string() } else { self.new_name.trim().to_string() };
-                        self.hosts.retain(|h| Ticket::decode(&h.ticket).map(|x| x.host_id != t.host_id).unwrap_or(true));
+                        let name = if self.new_name.trim().is_empty() {
+                            t.host_id.fmt_short().to_string()
+                        } else {
+                            self.new_name.trim().to_string()
+                        };
+                        self.hosts
+                            .retain(|h| Ticket::decode(&h.ticket).map(|x| x.host_id != t.host_id).unwrap_or(true));
                         self.hosts.push(SavedHost { name, ticket: t.encode(), last_connected: None });
                         let _ = config::save_hosts(&self.hosts);
                         self.new_name.clear();
@@ -321,73 +337,134 @@ impl App {
         });
     }
 
+    fn service_panel(&mut self, ui: &mut egui::Ui) {
+        #[cfg(windows)]
+        let running = crate::service::status() == Some(windows_service::service::ServiceState::Running);
+        #[cfg(not(windows))]
+        let running = false;
+        ui.horizontal(|ui| {
+            if running {
+                ui.colored_label(Color32::from_rgb(80, 200, 120), "●");
+                ui.label("Служба Windows работает: ПК доступен всегда, в том числе на экране блокировки и до входа в систему");
+            } else {
+                ui.colored_label(Color32::GRAY, "●");
+                ui.label("Служба Windows установлена, но не запущена");
+            }
+        });
+        let ticket = config::host_key()
+            .and_then(|k| Ok(Ticket { host_id: k.public(), secret: HostConfig::load_or_create()?.access_secret }));
+        match ticket {
+            Ok(t) => {
+                ui.add_space(8.0);
+                ui.label(format!("ID компьютера (постоянный адрес): {}", t.host_id));
+                ui.horizontal(|ui| {
+                    ui.label("Билет:");
+                    let ticket = t.encode();
+                    if self.this_pc.show_ticket {
+                        ui.label(egui::RichText::new(&ticket).monospace());
+                    } else {
+                        ui.label("••••••••••••");
+                    }
+                    if ui.button(if self.this_pc.show_ticket { "Скрыть" } else { "Показать" }).clicked() {
+                        self.this_pc.show_ticket ^= true;
+                    }
+                    if ui.button("📋 Копировать").clicked() {
+                        ui.ctx().copy_text(ticket);
+                        self.message = Some((false, "Билет скопирован. Храните его как пароль.".into()));
+                    }
+                });
+            }
+            // The service's files are readable by administrators only.
+            Err(_) => {
+                ui.label("Билет и журнал службы доступны администраторам: panda-rc ticket / panda-rc log в терминале администратора.");
+            }
+        }
+        ui.label(
+            egui::RichText::new(
+                "Управление службой — из терминала администратора: panda-rc service uninstall / install",
+            )
+            .weak(),
+        );
+        ui.ctx().request_repaint_after(Duration::from_secs(2));
+    }
+
     fn this_pc_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Этот компьютер");
         ui.add_space(6.0);
 
-        let (status, color) = match (&self.this_pc.host, self.this_pc.starting, self.this_pc.online) {
-            (_, true, _) => ("Запуск…", Color32::YELLOW),
-            (Some(_), _, true) => ("В сети — к этому ПК можно подключиться откуда угодно", Color32::from_rgb(80, 200, 120)),
-            (Some(_), _, false) => ("Подключение к сети…", Color32::YELLOW),
-            (None, _, _) => ("Хост выключен", Color32::GRAY),
-        };
-        ui.horizontal(|ui| {
-            ui.colored_label(color, "●");
-            ui.label(status);
-        });
-        ui.horizontal(|ui| {
-            if self.this_pc.host.is_none() {
-                if ui.add_enabled(!self.this_pc.starting, egui::Button::new("▶ Разрешить подключения")).clicked() {
-                    self.start_host();
+        // With the Windows service installed it is the host; the in-app host would fight it over the key.
+        let service_mode = config::service_installed();
+        if service_mode {
+            self.service_panel(ui);
+        }
+        if !service_mode {
+            let (status, color) = match (&self.this_pc.host, self.this_pc.starting, self.this_pc.online) {
+                (_, true, _) => ("Запуск…", Color32::YELLOW),
+                (Some(_), _, true) => {
+                    ("В сети — к этому ПК можно подключиться откуда угодно", Color32::from_rgb(80, 200, 120))
                 }
-            } else if ui.button("■ Остановить").clicked() {
-                self.stop_host();
-            }
-        });
-
-        if let Some(host) = &self.this_pc.host {
-            ui.add_space(8.0);
-            ui.label(format!("ID компьютера (постоянный адрес): {}", host.ticket.host_id));
+                (Some(_), _, false) => ("Подключение к сети…", Color32::YELLOW),
+                (None, _, _) => ("Хост выключен", Color32::GRAY),
+            };
             ui.horizontal(|ui| {
-                ui.label("Билет:");
-                let ticket = host.ticket.encode();
-                if self.this_pc.show_ticket {
-                    ui.label(egui::RichText::new(&ticket).monospace());
-                } else {
-                    ui.label("••••••••••••");
-                }
-                if ui.button(if self.this_pc.show_ticket { "Скрыть" } else { "Показать" }).clicked() {
-                    self.this_pc.show_ticket ^= true;
-                }
-                if ui.button("📋 Копировать").clicked() {
-                    ui.ctx().copy_text(ticket);
-                    self.message = Some((false, "Билет скопирован. Храните его как пароль.".into()));
-                }
+                ui.colored_label(color, "●");
+                ui.label(status);
             });
             ui.horizontal(|ui| {
-                if !self.this_pc.confirm_rotate {
-                    if ui.button("Сменить секрет…").clicked() {
-                        self.this_pc.confirm_rotate = true;
+                if self.this_pc.host.is_none() {
+                    if ui.add_enabled(!self.this_pc.starting, egui::Button::new("▶ Разрешить подключения")).clicked()
+                    {
+                        self.start_host();
                     }
-                } else {
-                    ui.label("Все выданные билеты перестанут работать. Продолжить?");
-                    if ui.button("Да, сменить").clicked() {
-                        self.this_pc.confirm_rotate = false;
-                        let res = HostConfig::load_or_create().and_then(|mut c| c.rotate_secret());
-                        match res {
-                            Ok(()) => {
-                                self.stop_host();
-                                self.start_host();
-                                self.message = Some((false, "Секрет обновлён, скопируйте новый билет.".into()));
+                } else if ui.button("■ Остановить").clicked() {
+                    self.stop_host();
+                }
+            });
+
+            if let Some(host) = &self.this_pc.host {
+                ui.add_space(8.0);
+                ui.label(format!("ID компьютера (постоянный адрес): {}", host.ticket.host_id));
+                ui.horizontal(|ui| {
+                    ui.label("Билет:");
+                    let ticket = host.ticket.encode();
+                    if self.this_pc.show_ticket {
+                        ui.label(egui::RichText::new(&ticket).monospace());
+                    } else {
+                        ui.label("••••••••••••");
+                    }
+                    if ui.button(if self.this_pc.show_ticket { "Скрыть" } else { "Показать" }).clicked() {
+                        self.this_pc.show_ticket ^= true;
+                    }
+                    if ui.button("📋 Копировать").clicked() {
+                        ui.ctx().copy_text(ticket);
+                        self.message = Some((false, "Билет скопирован. Храните его как пароль.".into()));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if !self.this_pc.confirm_rotate {
+                        if ui.button("Сменить секрет…").clicked() {
+                            self.this_pc.confirm_rotate = true;
+                        }
+                    } else {
+                        ui.label("Все выданные билеты перестанут работать. Продолжить?");
+                        if ui.button("Да, сменить").clicked() {
+                            self.this_pc.confirm_rotate = false;
+                            let res = HostConfig::load_or_create().and_then(|mut c| c.rotate_secret());
+                            match res {
+                                Ok(()) => {
+                                    self.stop_host();
+                                    self.start_host();
+                                    self.message = Some((false, "Секрет обновлён, скопируйте новый билет.".into()));
+                                }
+                                Err(e) => self.message = Some((true, format!("{e:#}"))),
                             }
-                            Err(e) => self.message = Some((true, format!("{e:#}"))),
+                        }
+                        if ui.button("Отмена").clicked() {
+                            self.this_pc.confirm_rotate = false;
                         }
                     }
-                    if ui.button("Отмена").clicked() {
-                        self.this_pc.confirm_rotate = false;
-                    }
-                }
-            });
+                });
+            }
         }
 
         ui.add_space(12.0);
@@ -420,7 +497,9 @@ impl App {
 
     fn desktop_view(&mut self, ui: &mut egui::Ui) {
         let gpu_video = self.gpu_video;
-        let Some(view) = self.desktop.as_mut() else { return };
+        let Some(view) = self.desktop.as_mut() else {
+            return;
+        };
         let mut disconnect = false;
 
         if !view.fullscreen {
@@ -494,7 +573,8 @@ impl App {
                     return;
                 }
                 if g.captured {
-                    let release = !focused || game_input(g, &events, mods, &view.out, &mut view.wheel, &mut view.fullscreen, ui.ctx());
+                    let release = !focused
+                        || game_input(g, &events, mods, &view.out, &mut view.wheel, &mut view.fullscreen, ui.ctx());
                     if release {
                         release_capture(g, &view.out, ui.ctx());
                     }
@@ -580,7 +660,9 @@ fn game_input(
         let _ = out.send(ClientMsg::Input(ev));
     };
     // egui reports modifiers as state, not key events: diff them into scancodes.
-    for (was, now, code) in [(g.mods.ctrl, mods.ctrl, SC_LCTRL), (g.mods.shift, mods.shift, SC_LSHIFT), (g.mods.alt, mods.alt, SC_LALT)] {
+    for (was, now, code) in
+        [(g.mods.ctrl, mods.ctrl, SC_LCTRL), (g.mods.shift, mods.shift, SC_LSHIFT), (g.mods.alt, mods.alt, SC_LALT)]
+    {
         if was != now {
             if now {
                 g.pressed.insert((code, false));
@@ -799,12 +881,7 @@ fn translate(ev: &egui::Event, rect: Rect, last_pos: &mut Option<(u16, u16)>, wh
             out.push(InputEvent::Key { key: KeyCode::Char(c), down: false, mods });
         }
         egui::Event::Key { key, pressed, modifiers, .. } => {
-            let mods = Modifiers {
-                ctrl: modifiers.ctrl,
-                shift: modifiers.shift,
-                alt: modifiers.alt,
-                meta: false,
-            };
+            let mods = Modifiers { ctrl: modifiers.ctrl, shift: modifiers.shift, alt: modifiers.alt, meta: false };
             if let Some(code) = map_key(*key, mods) {
                 out.push(InputEvent::Key { key: code, down: *pressed, mods });
             }

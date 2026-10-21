@@ -7,6 +7,8 @@ mod gui;
 mod host;
 mod media;
 mod proto;
+#[cfg(windows)]
+mod service;
 mod ticket;
 mod yuv_render;
 
@@ -16,7 +18,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "panda-rc", version, about = "P2P удалённый доступ и игровой туннель по ключу")]
+#[command(name = "panda-rc", version, about = "P2P удалённый доступ и игровой стриминг по ключу")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -29,6 +31,15 @@ enum Command {
         /// Сгенерировать новый секрет: все выданные ранее билеты перестанут работать
         #[arg(long)]
         rotate_secret: bool,
+        /// Запуск службой в сессии пользователя (не для ручного использования)
+        #[arg(long, hide = true)]
+        service_helper: bool,
+    },
+    /// Служба Windows: доступ на экране блокировки, в UAC и до входа в систему
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
     /// Показать билет подключения к этому ПК
     Ticket,
@@ -64,33 +75,112 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,iroh=warn,iroh_relay=warn,noq=warn".into()),
-        )
-        .init();
+#[cfg(windows)]
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Установить и запустить службу (от имени администратора)
+    Install,
+    /// Остановить и удалить службу (от имени администратора)
+    Uninstall,
+    /// Показать состояние службы
+    Status,
+    /// Точка входа службы (запускается Windows)
+    #[command(hide = true)]
+    Run,
+}
 
+fn init_logging(cli: &Cli) {
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,iroh=warn,iroh_relay=warn,noq=warn".into())
+    };
+    // The service and its helper have no console: log to a file next to their config.
+    let file_name = match &cli.command {
+        #[cfg(windows)]
+        Some(Command::Service { action: ServiceAction::Run }) => Some("service.log"),
+        Some(Command::Host { service_helper: true, .. }) => Some("helper.log"),
+        _ => None,
+    };
+    if let Some(name) = file_name {
+        let dir = config::machine_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(name);
+        // Keep logs bounded: start over once they pass 5 MB.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 << 20) {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+            return;
+        }
+    }
+    tracing_subscriber::fmt().with_env_filter(filter()).init();
+}
+
+fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_logging(&cli);
     let rt = tokio::runtime::Runtime::new()?;
 
     match cli.command {
         None => gui::run(rt, None),
-        Some(Command::Connect { ticket, game }) => gui::run(rt, Some((ticket::Ticket::decode(&ticket)?, profile(game)))),
+        Some(Command::Connect { ticket, game }) => {
+            gui::run(rt, Some((ticket::Ticket::decode(&ticket)?, profile(game))))
+        }
         Some(Command::Ticket) => {
-            let cfg = config::HostConfig::load_or_create()?;
+            let cfg = config::HostConfig::load_or_create().map_err(service_files_hint)?;
             let t = ticket::Ticket { host_id: config::host_key()?.public(), secret: cfg.access_secret };
             println!("{}", t.encode());
             Ok(())
         }
         Some(Command::Log) => {
-            for e in config::read_journal(100).into_iter().rev() {
-                println!("{}  {:<13} {} ({})  {}", e.ts, e.event, e.client_name, &e.client_id[..10.min(e.client_id.len())], e.detail);
+            let entries = config::read_journal(100);
+            if entries.is_empty() && config::service_installed() {
+                eprintln!("Журнал службы доступен только администраторам: запустите терминал от имени администратора.");
+            }
+            for e in entries.into_iter().rev() {
+                println!(
+                    "{}  {:<13} {} ({})  {}",
+                    e.ts,
+                    e.event,
+                    e.client_name,
+                    &e.client_id[..10.min(e.client_id.len())],
+                    e.detail
+                );
             }
             Ok(())
         }
-        Some(Command::Host { rotate_secret }) => rt.block_on(async {
+        #[cfg(windows)]
+        Some(Command::Service { action }) => match action {
+            ServiceAction::Install => {
+                service::install()?;
+                println!("Служба установлена и запущена. Билет прежний: panda-rc ticket");
+                Ok(())
+            }
+            ServiceAction::Uninstall => {
+                service::uninstall()?;
+                println!("Служба удалена.");
+                Ok(())
+            }
+            ServiceAction::Status => {
+                match service::status() {
+                    Some(state) => println!("Служба: {state:?}"),
+                    None => println!("Служба не установлена"),
+                }
+                Ok(())
+            }
+            ServiceAction::Run => service::run_dispatcher(),
+        },
+        Some(Command::Host { rotate_secret, service_helper }) => rt.block_on(async {
+            // Two hosts with one key would fight over the relay; the service already serves this PC.
+            #[cfg(windows)]
+            if !service_helper && service::status() == Some(windows_service::service::ServiceState::Running) {
+                anyhow::bail!("на этом ПК уже работает служба Panda Remote; она принимает подключения");
+            }
             let mut cfg = config::HostConfig::load_or_create()?;
             if rotate_secret {
                 cfg.rotate_secret()?;
@@ -100,6 +190,11 @@ fn main() -> Result<()> {
             println!("Хост запущен. ID: {}", host.ticket.host_id);
             println!("Билет подключения (храните как пароль):\n\n{}\n", host.ticket.encode());
             host.online().await;
+            tracing::info!(host_id = %host.ticket.host_id, "host online");
+            if service_helper {
+                // Runs until the service terminates this process.
+                std::future::pending::<()>().await;
+            }
             println!("В сети. Ctrl+C для остановки.");
             tokio::signal::ctrl_c().await?;
             host.shutdown().await;
@@ -110,7 +205,12 @@ fn main() -> Result<()> {
             let ticket = ticket::Ticket::decode(&ticket)?;
             let started = std::time::Instant::now();
             let session = client::connect(&ticket, profile(game)).await?;
-            println!("Подключено к «{}» за {:?} ({})", session.host_name, started.elapsed(), client::path_summary(&session.conn));
+            println!(
+                "Подключено к «{}» за {:?} ({})",
+                session.host_name,
+                started.elapsed(),
+                client::path_summary(&session.conn)
+            );
             let shared = Arc::new(client::viewer::Shared::default());
             let frames = Arc::new(std::sync::atomic::AtomicU32::new(0));
             let counter = frames.clone();
@@ -138,12 +238,27 @@ fn main() -> Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("bad frame"))?
                         .save(&out)?;
                     println!("Последний статус: {}", shared.status.lock().unwrap());
-                    println!("Кадр {}x{} сохранён в {}, событий отрисовки: {}", f.width, f.height, out.display(), frames.load(std::sync::atomic::Ordering::Relaxed));
+                    println!(
+                        "Кадр {}x{} сохранён в {}, событий отрисовки: {}",
+                        f.width,
+                        f.height,
+                        out.display(),
+                        frames.load(std::sync::atomic::Ordering::Relaxed)
+                    );
                     Ok(())
                 }
                 None => anyhow::bail!("кадры не получены"),
             }
         }),
+    }
+}
+
+/// With the service installed, host files are admin-only; say so instead of a bare access error.
+fn service_files_hint(e: anyhow::Error) -> anyhow::Error {
+    if config::service_installed() {
+        e.context("настройки службы доступны только администраторам: запустите терминал от имени администратора")
+    } else {
+        e
     }
 }
 
@@ -212,8 +327,12 @@ fn bench_encoder(hw: bool, fps: u32) -> Result<()> {
 fn thread_cpu_time() -> std::time::Duration {
     #[cfg(windows)]
     unsafe {
-        use windows::Win32::{Foundation::FILETIME, System::Threading::{GetCurrentThread, GetThreadTimes}};
-        let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        use windows::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetCurrentThread, GetThreadTimes},
+        };
+        let (mut c, mut e, mut k, mut u) =
+            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
         if GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u).is_ok() {
             let t = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) * 100;
             return std::time::Duration::from_nanos(t(k) + t(u));

@@ -55,11 +55,18 @@ pub fn run(conn: Connection, profile: Profile, control: Arc<Control>, start_tx: 
 enum Source {
     #[cfg(windows)]
     Dxgi(super::dxgi::Dxgi),
-    Gdi { monitor: Monitor, rgba: Vec<u8>, size: (u32, u32) },
+    Gdi {
+        monitor: Monitor,
+        rgba: Vec<u8>,
+        size: (u32, u32),
+    },
 }
 
 impl Source {
     fn open() -> Result<Self> {
+        // Lock screen / UAC live on another desktop; follow it when we are allowed to (service helper).
+        #[cfg(windows)]
+        super::desktop_switch::follow_input_desktop();
         #[cfg(windows)]
         match super::dxgi::Dxgi::new() {
             Ok(d) => return Ok(Source::Dxgi(d)),

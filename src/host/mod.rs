@@ -1,16 +1,21 @@
 //! Host side: accepts connections addressed to this machine's key, authenticates them
 //! and runs a streaming session.
 
-mod capture;
 mod audio;
-pub mod encoder;
-mod gamepad;
+mod capture;
+#[cfg(windows)]
+mod desktop_switch;
 #[cfg(windows)]
 mod dxgi;
+pub mod encoder;
+mod gamepad;
 mod input;
 mod session;
 
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, bail};
 use iroh::{
