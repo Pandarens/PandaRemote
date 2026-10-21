@@ -20,6 +20,7 @@ use crate::{
     client::{self, gamepad, viewer},
     config::{self, HostConfig, JournalEntry, SavedHost},
     host::Host,
+    icons::{self, Icon},
     media::annotate::{self, DrawEvent, Ink},
     proto::{ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, Profile},
     ticket::Ticket,
@@ -53,11 +54,33 @@ enum UiEvent {
         ticket: String,
     },
     DesktopEnded(Option<String>),
-    /// Elevated service install/uninstall finished: (installing, result).
-    ServiceDone(bool, Result<(), String>),
+    /// An elevated service operation finished.
+    ServiceDone(ServiceOp, Result<(), String>),
+    /// The host wants a PIN: none was given, or it refused the one given (the reason).
+    PinNeeded(Option<String>),
 }
 
-#[derive(PartialEq)]
+/// What runs with administrator rights (UAC prompt) through `panda-rc service …`.
+#[derive(Clone, Copy)]
+enum ServiceOp {
+    Install,
+    Uninstall,
+    /// Copy the service's ticket into this user's folder.
+    SyncTicket,
+    /// Set (true) or remove (false) the service's PIN.
+    SetPin(bool),
+}
+
+/// The PIN dialog shown when a host asks for one; connecting again sends it.
+struct PinPrompt {
+    name: String,
+    ticket: String,
+    profile: Profile,
+    pin: String,
+    error: Option<String>,
+}
+
+#[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Hosts,
     ThisPc,
@@ -81,6 +104,7 @@ struct App {
 
     this_pc: ThisPc,
     desktop: Option<DesktopView>,
+    pin_prompt: Option<PinPrompt>,
     /// NV12 frames are drawn by a wgpu shader; otherwise converted to RGBA on the CPU.
     gpu_video: bool,
     settings: config::Settings,
@@ -125,12 +149,16 @@ struct ThisPc {
     confirm_rotate: bool,
     journal: Vec<JournalEntry>,
     journal_at: Option<Instant>,
-    /// An elevated install/uninstall is running.
+    journal_open: bool,
+    /// An elevated service operation is running.
     service_busy: bool,
+    /// The PIN being typed in settings.
+    pin_edit: Option<String>,
 }
 
 struct DesktopView {
     name: String,
+    ticket: String,
     profile: Profile,
     shared: Arc<viewer::Shared>,
     out: tmpsc::UnboundedSender<ClientMsg>,
@@ -254,8 +282,11 @@ impl App {
                 service_busy: false,
                 journal: Vec::new(),
                 journal_at: None,
+                journal_open: false,
+                pin_edit: None,
             },
             desktop: None,
+            pin_prompt: None,
             gpu_video,
             settings,
             presence: Arc::default(),
@@ -272,7 +303,7 @@ impl App {
             app.start_host();
         }
         if let Some((t, profile)) = initial {
-            app.start_session("Удалённый ПК".into(), t.encode(), profile);
+            app.start_session("Удалённый ПК".into(), t.encode(), profile, None);
         }
         app
     }
@@ -379,17 +410,31 @@ impl App {
                     self.message = Some((true, format!("Не удалось запустить хост: {e:#}")));
                 }
                 UiEvent::HostOnline => self.this_pc.online = true,
-                UiEvent::ServiceDone(installing, result) => {
+                UiEvent::ServiceDone(op, result) => {
                     self.this_pc.service_busy = false;
-                    self.message = Some(match (installing, result) {
-                        (true, Ok(())) => (
+                    self.message = Some(match (op, result) {
+                        (ServiceOp::Install, Ok(())) => (
                             false,
                             "Служба установлена и запущена: ПК доступен на экране блокировки и до входа в систему."
                                 .into(),
                         ),
-                        (false, Ok(())) => (false, "Служба удалена.".into()),
+                        (ServiceOp::Uninstall, Ok(())) => (false, "Служба удалена.".into()),
+                        (ServiceOp::SyncTicket, Ok(())) => (false, "Билет службы теперь виден здесь.".into()),
+                        (ServiceOp::SetPin(true), Ok(())) => {
+                            (false, "PIN-код задан: без него к этому ПК не войти.".into())
+                        }
+                        (ServiceOp::SetPin(false), Ok(())) => (false, "PIN-код убран.".into()),
                         (_, Err(e)) => (true, format!("Служба: {e}")),
                     });
+                }
+                UiEvent::PinNeeded(error) => {
+                    if let Some(d) = self.desktop.take() {
+                        if d.fullscreen {
+                            self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        }
+                        let (name, ticket, profile) = (d.name, d.ticket, d.profile);
+                        self.pin_prompt = Some(PinPrompt { name, ticket, profile, pin: String::new(), error });
+                    }
                 }
                 UiEvent::Connected { ticket } => {
                     if let Some(h) = self.hosts.iter_mut().find(|h| h.ticket == ticket) {
@@ -414,7 +459,7 @@ impl App {
 
     // ---------- actions ----------
 
-    fn start_session(&mut self, name: String, ticket_str: String, profile: Profile) {
+    fn start_session(&mut self, name: String, ticket_str: String, profile: Profile, pin: Option<String>) {
         let ticket = match Ticket::decode(&ticket_str) {
             Ok(t) => t,
             Err(e) => {
@@ -428,15 +473,18 @@ impl App {
         let send = self.send_event();
         let ctx = self.ctx.clone();
         let repaint: viewer::Repaint = Arc::new(move || ctx.request_repaint());
-        let (shared2, out_tx2) = (shared.clone(), out_tx.clone());
+        let (shared2, out_tx2, ticket_str2) = (shared.clone(), out_tx.clone(), ticket_str.clone());
         let task = self.rt.spawn(async move {
             let res = async {
-                let session = client::connect(&ticket, profile).await?;
-                send(UiEvent::Connected { ticket: ticket_str });
+                let session = client::connect(&ticket, profile, pin.as_deref()).await?;
+                send(UiEvent::Connected { ticket: ticket_str2 });
                 viewer::run(session, shared2, out_tx2, out_rx, repaint, true).await
             }
             .await;
-            send(UiEvent::DesktopEnded(res.err().map(|e| format!("{e:#}"))));
+            match res.as_ref().err().and_then(|e| e.downcast_ref::<client::PinError>()) {
+                Some(pin) => send(UiEvent::PinNeeded(pin.0.clone())),
+                None => send(UiEvent::DesktopEnded(res.err().map(|e| format!("{e:#}")))),
+            }
         });
         let game = (profile == Profile::Game).then(|| {
             let pad_stop = Arc::new(AtomicBool::new(false));
@@ -446,6 +494,7 @@ impl App {
         self.message = None;
         self.desktop = Some(DesktopView {
             name,
+            ticket: ticket_str,
             profile,
             shared,
             out: out_tx,
@@ -511,30 +560,40 @@ impl App {
         let online = self.hosts.iter().filter(|h| matches!(state(h), Some(Presence::Online(_)))).count();
 
         ui.horizontal(|ui| {
-            ui.heading("Компьютеры");
+            ui.label(semibold("Компьютеры", 18.0));
             if !self.hosts.is_empty() {
-                ui.label(egui::RichText::new(format!("{online} из {} в сети", self.hosts.len())).weak());
+                ui.label(muted(format!("{online} из {} в сети", self.hosts.len())));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(primary_button("+ Добавить")).clicked() {
+                let kind = if self.adding { Kind::Secondary } else { Kind::Primary };
+                if button(ui, Some(Icon::Plus), "Добавить", kind).clicked() {
                     self.adding ^= true;
                 }
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
         if self.adding {
             self.add_form(ui);
-            ui.add_space(6.0);
         }
 
         if self.hosts.is_empty() && !self.adding {
             card(ui, |ui| {
-                ui.label(egui::RichText::new("Как подключиться к своему компьютеру").strong());
-                ui.add_space(4.0);
-                ui.label("1. На том компьютере откройте Panda → «Этот ПК» → «Разрешить доступ».");
-                ui.label("2. Нажмите «Копировать билет» и перешлите его себе (это как пароль).");
-                ui.label("3. Здесь нажмите «+ Добавить» и вставьте билет.");
+                ui.horizontal(|ui| {
+                    icon_tile(ui, Icon::Devices, ACCENT_SOFT, ACCENT_TILE);
+                    ui.vertical(|ui| {
+                        ui.label(semibold("Как подключиться к своему компьютеру", 14.0));
+                        ui.label(muted("Три шага, без регистрации и IP-адресов").small());
+                    });
+                });
+                ui.add_space(6.0);
+                for step in [
+                    "1.  На том компьютере откройте Panda → «Этот ПК» → «Разрешить доступ».",
+                    "2.  Скопируйте билет и перешлите его себе — он работает как пароль.",
+                    "3.  Здесь нажмите «Добавить» и вставьте билет.",
+                ] {
+                    ui.label(egui::RichText::new(step).color(SOFT));
+                }
             });
             return;
         }
@@ -547,55 +606,69 @@ impl App {
             for i in order {
                 let h = &self.hosts[i];
                 let st = state(h);
+                let is_online = matches!(st, Some(Presence::Online(_)));
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
                         let (color, line) = match &st {
-                            Some(Presence::Online(route)) => (GREEN, format!("в сети · {route}")),
+                            Some(Presence::Online(route)) => (GREEN, format!("В сети · {route}")),
                             Some(Presence::Offline) => (
-                                Color32::GRAY,
+                                OFFLINE,
                                 h.last_connected
                                     .as_deref()
-                                    .map(|t| format!("не в сети · был {}", t[..16.min(t.len())].replace('T', " ")))
-                                    .unwrap_or_else(|| "не в сети".into()),
+                                    .map(|t| format!("Не в сети · был {}", t[..16.min(t.len())].replace('T', " ")))
+                                    .unwrap_or_else(|| "Не в сети".into()),
                             ),
-                            None => (YELLOW, "проверка…".into()),
+                            None => (YELLOW, "Проверка…".into()),
                         };
                         status_dot(ui, color);
+                        ui.add_space(2.0);
                         ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
                             if let Some((idx, name)) = self.renaming.as_mut().filter(|(idx, _)| *idx == i) {
-                                let resp = ui.add(egui::TextEdit::singleline(name).desired_width(200.0));
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(name)
+                                        .desired_width(200.0)
+                                        .margin(egui::Margin::symmetric(8, 4)),
+                                );
                                 if resp.lost_focus() {
                                     action = Some((*idx, "rename_done"));
                                 }
                                 resp.request_focus();
                             } else {
-                                ui.label(egui::RichText::new(&h.name).strong().size(15.0));
+                                let name = semibold(&h.name, 14.0);
+                                ui.label(if is_online { name } else { name.color(SOFT) });
                             }
-                            ui.label(egui::RichText::new(line).small().weak());
+                            ui.label(muted(line).small());
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.menu_button("⋯", |ui| {
-                                if ui.button("✏ Переименовать").clicked() {
+                            let more = icon_button(ui, Icon::More, "Ещё", Kind::Secondary);
+                            egui::Popup::menu(&more).show(|ui| {
+                                ui.set_min_width(190.0);
+                                if menu_item(ui, Icon::Rename, "Переименовать", false).clicked() {
                                     action = Some((i, "rename"));
                                     ui.close();
                                 }
-                                if ui.button("📋 Копировать билет").clicked() {
+                                if menu_item(ui, Icon::Copy, "Копировать билет", false).clicked() {
                                     ui.ctx().copy_text(h.ticket.clone());
                                     ui.close();
                                 }
-                                if ui.button("🗑 Удалить").clicked() {
+                                if menu_item(ui, Icon::Trash, "Удалить", true).clicked() {
                                     action = Some((i, "delete"));
                                     ui.close();
                                 }
                             });
-                            if ui
-                                .button("🎮")
-                                .on_hover_text("Игровой режим: 60 к/с, захват мыши, геймпад, звук")
-                                .clicked()
+                            if icon_button(
+                                ui,
+                                Icon::Gamepad,
+                                "Игровой режим: 60 к/с, захват мыши, геймпад, звук",
+                                Kind::Secondary,
+                            )
+                            .clicked()
                             {
                                 action = Some((i, "game"));
                             }
-                            if ui.add(primary_button("Подключиться")).clicked() {
+                            let kind = if is_online { Kind::Primary } else { Kind::Secondary };
+                            if button(ui, Some(Icon::Monitor), "Подключиться", kind).clicked() {
                                 action = Some((i, "desktop"));
                             }
                         });
@@ -606,8 +679,8 @@ impl App {
         if let Some((i, what)) = action {
             let h = self.hosts[i].clone();
             match what {
-                "desktop" => self.start_session(h.name, h.ticket, Profile::Desktop),
-                "game" => self.start_session(h.name, h.ticket, Profile::Game),
+                "desktop" => self.start_session(h.name, h.ticket, Profile::Desktop, None),
+                "game" => self.start_session(h.name, h.ticket, Profile::Game, None),
                 "rename" => self.renaming = Some((i, h.name)),
                 "rename_done" => {
                     if let Some((_, name)) = self.renaming.take()
@@ -627,20 +700,23 @@ impl App {
 
     fn add_form(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
-            ui.label(egui::RichText::new("Новый компьютер").strong());
+            ui.label(semibold("Новый компьютер", 14.0));
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_name)
                         .hint_text("Название, например «Дом»")
-                        .desired_width(170.0),
+                        .desired_width(170.0)
+                        .margin(egui::Margin::symmetric(10, 8)),
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_ticket)
                         .hint_text("Билет panda1…")
-                        .desired_width(ui.available_width() - 170.0)
+                        .desired_width((ui.available_width() - 200.0).max(120.0))
+                        .margin(egui::Margin::symmetric(10, 8))
                         .password(true),
                 );
-                if ui.add(primary_button("Добавить")).clicked() {
+                if button(ui, None, "Добавить", Kind::Primary).clicked() {
                     match Ticket::decode(&self.new_ticket) {
                         Ok(t) => {
                             let name = if self.new_name.trim().is_empty() {
@@ -661,35 +737,51 @@ impl App {
                         }
                     }
                 }
-                if ui.button("Отмена").clicked() {
+                if button(ui, None, "Отмена", Kind::Ghost).clicked() {
                     self.adding = false;
                 }
             });
         });
     }
 
-    /// The ticket row: masked, show/copy.
+    /// The ticket field: masked, show/copy.
     fn ticket_row(&mut self, ui: &mut egui::Ui, ticket: &str) {
         ui.horizontal(|ui| {
-            let shown = if self.this_pc.show_ticket {
-                ticket.to_string()
-            } else {
-                "••••••••••••••••".into()
-            };
-            ui.label(egui::RichText::new(shown).monospace());
-            if ui.small_button(if self.this_pc.show_ticket { "Скрыть" } else { "Показать" }).clicked() {
-                self.this_pc.show_ticket ^= true;
-            }
-            if ui.add(primary_button("📋 Копировать билет")).clicked() {
-                ui.ctx().copy_text(ticket.to_string());
-                self.message = Some((false, "Билет скопирован. Он работает как пароль — не публикуйте его.".into()));
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if button(ui, Some(Icon::Copy), "Копировать", Kind::Primary).clicked() {
+                    ui.ctx().copy_text(ticket.to_string());
+                    self.message =
+                        Some((false, "Билет скопирован. Он работает как пароль — не публикуйте его.".into()));
+                }
+                let (eye, tip) = if self.this_pc.show_ticket {
+                    (Icon::EyeOff, "Скрыть")
+                } else {
+                    (Icon::Eye, "Показать")
+                };
+                if icon_button(ui, eye, tip, Kind::Secondary).clicked() {
+                    self.this_pc.show_ticket ^= true;
+                }
+                let (shown, color) = if self.this_pc.show_ticket {
+                    (ticket.to_string(), TEXT)
+                } else {
+                    ("panda1 ••••••••••••••••••••••••".to_string(), MUTED)
+                };
+                egui::Frame::new()
+                    .fill(BG)
+                    .stroke(egui::Stroke::new(1.0, RAISED_BORDER))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(12, 7))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(shown).monospace().color(color)).truncate());
+                        });
+                    });
+            });
         });
     }
 
     fn this_pc_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Этот ПК");
-        ui.add_space(4.0);
         // With the Windows service installed it is the host; the in-app host would fight it over the key.
         let service_mode = config::service_installed();
 
@@ -697,21 +789,31 @@ impl App {
             if service_mode {
                 self.service_status(ui);
             } else {
-                let (text, color) = match (&self.this_pc.host, self.this_pc.starting, self.this_pc.online) {
-                    (_, true, _) | (Some(_), _, false) => ("Включается…", YELLOW),
-                    (Some(_), _, true) => ("Доступ открыт: к этому ПК можно подключиться откуда угодно", GREEN),
-                    (None, _, _) => ("Доступ закрыт", Color32::GRAY),
+                let host_on = self.this_pc.host.is_some();
+                let (fg, bg, title, sub) = match (host_on, self.this_pc.starting, self.this_pc.online) {
+                    (_, true, _) | (true, _, false) => (YELLOW, YELLOW_TILE, "Включается…", "Подключение к сети Panda"),
+                    (true, _, true) => (
+                        GREEN,
+                        GREEN_TILE,
+                        "Доступ открыт",
+                        "К этому ПК можно подключиться откуда угодно, пока Panda запущена",
+                    ),
+                    (false, _, _) => (MUTED, RAISED, "Доступ закрыт", "Откройте доступ, чтобы подключаться к этому ПК"),
                 };
                 ui.horizontal(|ui| {
-                    status_dot(ui, color);
-                    ui.label(egui::RichText::new(text).strong());
+                    icon_tile(ui, Icon::Power, fg, bg);
+                    title_block(ui, title, sub);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.this_pc.host.is_none() {
-                            if ui.add_enabled(!self.this_pc.starting, primary_button("Разрешить доступ")).clicked()
+                        if !host_on {
+                            let enabled = !self.this_pc.starting;
+                            if ui
+                                .add_enabled_ui(enabled, |ui| button(ui, None, "Разрешить доступ", Kind::Primary))
+                                .inner
+                                .clicked()
                             {
                                 self.start_host();
                             }
-                        } else if ui.button("Закрыть доступ").clicked() {
+                        } else if button(ui, None, "Закрыть доступ", Kind::Secondary).clicked() {
                             self.stop_host();
                         }
                     });
@@ -719,84 +821,171 @@ impl App {
             }
         });
 
-        // Ticket: from the running in-app host, or from the service's files (admin-only).
-        let ticket = if service_mode {
-            config::host_key()
-                .and_then(|k| Ok(Ticket { host_id: k.public(), secret: HostConfig::load_or_create()?.access_secret }))
-                .ok()
-                .map(|t| t.encode())
-        } else {
-            self.this_pc.host.as_ref().map(|h| h.ticket.encode())
-        };
+        // Ticket: from the running in-app host, else from this user's host files (the service runs on a copy).
+        let user_host = config::user_host();
+        let ticket = self.this_pc.host.as_ref().map(|h| h.ticket.encode()).or_else(|| {
+            user_host.as_ref().map(|(id, cfg)| Ticket { host_id: *id, secret: cfg.access_secret }.encode())
+        });
         if let Some(ticket) = ticket {
             card(ui, |ui| {
-                ui.label(egui::RichText::new("Билет для подключения").strong());
+                ui.horizontal(|ui| {
+                    icon(ui, Icon::Key, MUTED, 16.0);
+                    ui.label(semibold("Билет для подключения", 13.5));
+                    ui.label(muted("— работает как пароль").small());
+                    if !service_mode {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.rotate_secret_row(ui);
+                        });
+                    }
+                });
+                ui.add_space(2.0);
                 self.ticket_row(ui, &ticket);
-                if !service_mode {
-                    self.rotate_secret_row(ui);
-                }
             });
         } else if service_mode {
             card(ui, |ui| {
-                ui.label("Билет службы виден только администраторам: panda-rc ticket в терминале администратора.");
+                ui.horizontal(|ui| {
+                    icon(ui, Icon::Key, MUTED, 16.0);
+                    ui.label(muted(
+                        "Билет хранится у службы: покажите его здесь один раз (нужны права администратора).",
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let busy = self.this_pc.service_busy;
+                        if ui
+                            .add_enabled_ui(!busy, |ui| {
+                                button(ui, Some(Icon::Shield), "Показать билет…", Kind::Secondary)
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            self.service_op(ServiceOp::SyncTicket);
+                        }
+                    });
+                });
             });
         }
 
         card(ui, |ui| {
-            ui.label(egui::RichText::new("Настройки").strong());
-            if ui.checkbox(&mut self.settings.autostart, "Запускать Panda вместе с Windows (свёрнутой)").changed()
-            {
-                let _ = config::save_settings(&self.settings);
-                if let Err(e) = autostart::set(self.settings.autostart) {
-                    self.message = Some((true, format!("Автозапуск: {e:#}")));
-                }
-            }
-            #[cfg(windows)]
-            if !service_mode {
-                ui.horizontal(|ui| {
-                    ui.label("🔒 Доступ на экране блокировки и после перезагрузки:");
-                    let label = if self.this_pc.service_busy {
-                        "Установка…"
-                    } else {
-                        "Установить службу…"
-                    };
-                    if ui.add_enabled(!self.this_pc.service_busy, egui::Button::new(label)).clicked() {
-                        self.service_action(true);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
+                icon(ui, Icon::Power, MUTED, 16.0);
+                ui.label("Запускать вместе с Windows");
+                ui.label(muted("свёрнутой").small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if toggle(ui, &mut self.settings.autostart).changed() {
+                        let _ = config::save_settings(&self.settings);
+                        if let Err(e) = autostart::set(self.settings.autostart) {
+                            self.message = Some((true, format!("Автозапуск: {e:#}")));
+                        }
                     }
                 });
-            }
-        });
-
-        card(ui, |ui| {
+            });
+            ui.separator();
+            let pin_on = user_host.as_ref().is_some_and(|(_, c)| c.pin.is_some());
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("Panda {}", Version::current())).strong());
+                ui.set_min_height(32.0);
+                icon(ui, Icon::Pin, MUTED, 16.0);
+                ui.label("PIN-код при подключении");
+                ui.label(muted(if pin_on { "включён" } else { "выключен" }).small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let busy = self.this_pc.service_busy;
+                    if let Some(pin) = self.this_pc.pin_edit.as_mut() {
+                        let ok = config::valid_pin(pin);
+                        let save =
+                            ui.add_enabled_ui(ok, |ui| button(ui, None, "Сохранить", Kind::Primary)).inner.clicked();
+                        let cancel = button(ui, None, "Отмена", Kind::Ghost).clicked();
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(pin)
+                                .password(true)
+                                .hint_text("4–8 цифр")
+                                .desired_width(110.0)
+                                .margin(egui::Margin::symmetric(10, 7)),
+                        );
+                        pin.retain(|c| c.is_ascii_digit());
+                        pin.truncate(8);
+                        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if (save || enter) && ok {
+                            let pin = self.this_pc.pin_edit.take();
+                            self.save_pin(pin, service_mode);
+                        } else if cancel {
+                            self.this_pc.pin_edit = None;
+                        }
+                    } else if ui
+                        .add_enabled_ui(!busy, |ui| {
+                            button(ui, None, if pin_on { "Изменить…" } else { "Задать…" }, Kind::Secondary)
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        self.this_pc.pin_edit = Some(String::new());
+                    } else if pin_on
+                        && ui.add_enabled_ui(!busy, |ui| button(ui, None, "Выключить", Kind::Ghost)).inner.clicked()
+                    {
+                        self.save_pin(None, service_mode);
+                    }
+                });
+            });
+            #[cfg(windows)]
+            if !service_mode {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.set_min_height(32.0);
+                    icon(ui, Icon::Lock, MUTED, 16.0);
+                    ui.label("Доступ на экране блокировки и после перезагрузки");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let busy = self.this_pc.service_busy;
+                        let label = if busy { "Установка…" } else { "Установить службу…" };
+                        if ui
+                            .add_enabled_ui(!busy, |ui| button(ui, Some(Icon::Shield), label, Kind::Secondary))
+                            .inner
+                            .clicked()
+                        {
+                            self.service_op(ServiceOp::Install);
+                        }
+                        if busy {
+                            ui.spinner();
+                        }
+                    });
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
+                icon(ui, Icon::Refresh, MUTED, 16.0);
+                ui.label(format!("Panda {}", Version::current()));
                 let state = self.update.lock().unwrap().clone();
                 match &state {
                     UpdateState::Checking => {
                         ui.spinner();
-                        ui.label(egui::RichText::new("проверка обновлений…").weak());
+                        ui.label(muted("проверка обновлений…"));
                     }
                     UpdateState::UpToDate => {
-                        ui.label(egui::RichText::new("последняя версия").weak());
+                        ui.label(muted("· последняя версия"));
                     }
                     UpdateState::Ready(v, _) => {
-                        ui.label(egui::RichText::new(format!("загружена {v}")).color(GREEN));
+                        ui.label(egui::RichText::new(format!("· загружена {v}")).color(GREEN));
                     }
                     UpdateState::ByService(v) => {
-                        ui.label(egui::RichText::new(format!("вышла {v}: служба обновит программу сама")).weak());
+                        ui.label(muted(format!("· вышла {v}: служба обновит программу сама")));
                     }
                     UpdateState::Failed(e) => {
-                        ui.label(egui::RichText::new("не удалось проверить обновления").color(YELLOW)).on_hover_text(e);
+                        ui.label(egui::RichText::new("· не удалось проверить обновления").color(YELLOW))
+                            .on_hover_text(e);
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if matches!(state, UpdateState::Ready(..)) {
-                        if ui.add(primary_button("Обновить сейчас")).on_hover_text("Перезапустит Panda").clicked()
+                        if button(ui, None, "Обновить сейчас", Kind::Primary)
+                            .on_hover_text("Перезапустит Panda")
+                            .clicked()
                         {
                             self.maybe_apply_update(true);
                         }
                     } else if ui
-                        .add_enabled(!matches!(state, UpdateState::Checking), egui::Button::new("Проверить"))
+                        .add_enabled_ui(!matches!(state, UpdateState::Checking), |ui| {
+                            button(ui, None, "Проверить", Kind::Secondary)
+                        })
+                        .inner
                         .clicked()
                     {
                         self.update_now.notify_one();
@@ -805,60 +994,67 @@ impl App {
             });
         });
 
-        egui::CollapsingHeader::new("Журнал подключений").default_open(false).show(ui, |ui| {
+        let chevron = if self.this_pc.journal_open { Icon::ChevronDown } else { Icon::Chevron };
+        if button(ui, Some(chevron), "Журнал подключений", Kind::Ghost).clicked() {
+            self.this_pc.journal_open ^= true;
+        }
+        if self.this_pc.journal_open {
             if self.this_pc.journal_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
                 self.this_pc.journal = config::read_journal(50);
                 self.this_pc.journal_at = Some(Instant::now());
             }
-            if self.this_pc.journal.is_empty() {
-                ui.label(egui::RichText::new("Подключений ещё не было").weak());
-            }
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                egui::Grid::new("journal").striped(true).spacing([10.0, 3.0]).show(ui, |ui| {
-                    for e in &self.this_pc.journal {
-                        ui.label(egui::RichText::new(e.ts.replace('T', " ").trim_end_matches('Z')).small());
-                        let ev = match e.event.as_str() {
-                            "connected" => "✅ вход",
-                            "disconnected" => "⏹ выход",
-                            "auth_failed" => "⛔ отказ",
-                            other => other,
-                        };
-                        ui.label(egui::RichText::new(ev).small());
-                        ui.label(egui::RichText::new(&e.client_name).small());
-                        ui.label(egui::RichText::new(&e.detail).small().weak());
-                        ui.end_row();
-                    }
+            card(ui, |ui| {
+                if self.this_pc.journal.is_empty() {
+                    ui.label(muted("Подключений ещё не было"));
+                }
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    egui::Grid::new("journal").spacing([14.0, 5.0]).show(ui, |ui| {
+                        for e in &self.this_pc.journal {
+                            ui.label(muted(e.ts.replace('T', " ").trim_end_matches('Z').to_string()).small());
+                            let (ev, color) = match e.event.as_str() {
+                                "connected" => ("вход", GREEN),
+                                "disconnected" => ("выход", MUTED),
+                                "auth_failed" => ("отказ", RED),
+                                other => (other, MUTED),
+                            };
+                            ui.label(egui::RichText::new(ev).small().color(color));
+                            ui.label(egui::RichText::new(&e.client_name).small());
+                            ui.label(muted(&e.detail).small());
+                            ui.end_row();
+                        }
+                    });
                 });
             });
-        });
+        }
         ui.ctx().request_repaint_after(Duration::from_secs(2));
     }
 
+    /// "Change ticket" with an inline confirmation (laid out right to left).
     fn rotate_secret_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if !self.this_pc.confirm_rotate {
-                if ui.small_button("Сменить билет…").on_hover_text("Если билет попал не в те руки").clicked()
-                {
-                    self.this_pc.confirm_rotate = true;
-                }
-            } else {
-                ui.label(egui::RichText::new("Все выданные билеты перестанут работать.").small());
-                if ui.small_button("Сменить").clicked() {
-                    self.this_pc.confirm_rotate = false;
-                    match HostConfig::load_or_create().and_then(|mut c| c.rotate_secret()) {
-                        Ok(()) => {
-                            self.stop_host();
-                            self.start_host();
-                            self.message = Some((false, "Билет обновлён — скопируйте новый.".into()));
-                        }
-                        Err(e) => self.message = Some((true, format!("{e:#}"))),
-                    }
-                }
-                if ui.small_button("Отмена").clicked() {
-                    self.this_pc.confirm_rotate = false;
-                }
+        if !self.this_pc.confirm_rotate {
+            if small_button(ui, None, "Сменить билет…", Kind::Ghost)
+                .on_hover_text("Если билет попал не в те руки")
+                .clicked()
+            {
+                self.this_pc.confirm_rotate = true;
             }
-        });
+            return;
+        }
+        if small_button(ui, None, "Отмена", Kind::Ghost).clicked() {
+            self.this_pc.confirm_rotate = false;
+        }
+        if small_button(ui, None, "Сменить", Kind::Danger).clicked() {
+            self.this_pc.confirm_rotate = false;
+            match HostConfig::load_or_create().and_then(|mut c| c.rotate_secret()) {
+                Ok(()) => {
+                    self.stop_host();
+                    self.start_host();
+                    self.message = Some((false, "Билет обновлён — скопируйте новый.".into()));
+                }
+                Err(e) => self.message = Some((true, format!("{e:#}"))),
+            }
+        }
+        ui.label(muted("Старые билеты перестанут работать").small());
     }
 
     fn service_status(&mut self, ui: &mut egui::Ui) {
@@ -868,25 +1064,36 @@ impl App {
         let running = false;
         ui.horizontal(|ui| {
             if running {
-                status_dot(ui, GREEN);
-                ui.label(egui::RichText::new("Доступ открыт всегда (служба Windows)").strong()).on_hover_text(
-                    "Работает и на экране блокировки, в окнах UAC и после перезагрузки до входа в систему",
+                icon_tile(ui, Icon::Shield, GREEN, GREEN_TILE);
+                title_block(
+                    ui,
+                    "Доступ открыт всегда",
+                    "Служба Windows: работает на экране блокировки, в окнах UAC и после перезагрузки",
                 );
             } else {
-                status_dot(ui, Color32::GRAY);
-                ui.label(egui::RichText::new("Служба установлена, но не запущена").strong());
+                icon_tile(ui, Icon::Shield, MUTED, RAISED);
+                title_block(ui, "Служба установлена, но не запущена", "Обновите её до этой версии или переустановите");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let busy = self.this_pc.service_busy;
-                ui.menu_button("Служба…", |ui| {
+                let menu = button(ui, None, "Служба…", Kind::Secondary);
+                egui::Popup::menu(&menu).show(|ui| {
+                    ui.set_min_width(220.0);
                     // Reinstalling over the running service upgrades it to this version of the program.
-                    if ui.add_enabled(!busy, egui::Button::new("Обновить до этой версии…")).clicked()
+                    if ui
+                        .add_enabled_ui(!busy, |ui| menu_item(ui, Icon::Refresh, "Обновить до этой версии…", false))
+                        .inner
+                        .clicked()
                     {
-                        self.service_action(true);
+                        self.service_op(ServiceOp::Install);
                         ui.close();
                     }
-                    if ui.add_enabled(!busy, egui::Button::new("Удалить службу…")).clicked() {
-                        self.service_action(false);
+                    if ui
+                        .add_enabled_ui(!busy, |ui| menu_item(ui, Icon::Trash, "Удалить службу…", true))
+                        .inner
+                        .clicked()
+                    {
+                        self.service_op(ServiceOp::Uninstall);
                         ui.close();
                     }
                 });
@@ -898,83 +1105,180 @@ impl App {
         ui.ctx().request_repaint_after(Duration::from_secs(2));
     }
 
-    /// Installs or removes the service with a UAC prompt, off the UI thread.
-    fn service_action(&mut self, install: bool) {
+    /// Runs a service operation with a UAC prompt, off the UI thread.
+    fn service_op(&mut self, op: ServiceOp) {
         #[cfg(windows)]
         {
-            if install {
+            if let ServiceOp::Install = op {
                 // The service takes over this PC's key; the in-app host must not compete with it.
                 self.stop_host();
             }
+            let action = match op {
+                ServiceOp::Install => "install".to_string(),
+                ServiceOp::Uninstall => "uninstall".to_string(),
+                ServiceOp::SyncTicket => format!("sync-ticket --to \"{}\"", config::user_dir().display()),
+                ServiceOp::SetPin(_) => {
+                    format!("set-pin --pin-file \"{}\" --to \"{}\"", pin_file().display(), config::user_dir().display())
+                }
+            };
             self.this_pc.service_busy = true;
             let send = self.send_event();
             std::thread::spawn(move || {
-                let result = crate::service::run_elevated(if install { "install" } else { "uninstall" });
-                send(UiEvent::ServiceDone(install, result.map_err(|e| format!("{e:#}"))));
+                let result = crate::service::run_elevated(&action);
+                send(UiEvent::ServiceDone(op, result.map_err(|e| format!("{e:#}"))));
             });
         }
         #[cfg(not(windows))]
-        let _ = install;
+        let _ = op;
+    }
+
+    /// Sets or removes the PIN: directly for the in-app host, through an elevated step for the service.
+    fn save_pin(&mut self, pin: Option<String>, service_mode: bool) {
+        if service_mode {
+            // Handed over in a file in this user's private folder, not on a command line.
+            match std::fs::write(pin_file(), pin.as_deref().unwrap_or("")) {
+                Ok(()) => self.service_op(ServiceOp::SetPin(pin.is_some())),
+                Err(e) => self.message = Some((true, format!("PIN-код: {e}"))),
+            }
+            return;
+        }
+        let result = HostConfig::load_or_create().and_then(|mut c| c.set_pin(pin.as_deref()));
+        self.message = Some(match result {
+            Ok(()) if pin.is_some() => (false, "PIN-код задан: без него к этому ПК не войти.".into()),
+            Ok(()) => (false, "PIN-код убран.".into()),
+            Err(e) => (true, format!("{e:#}")),
+        });
+    }
+
+    /// Asks for the PIN of a host that wants one, then connects again with it.
+    fn pin_dialog(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.pin_prompt.as_mut() else { return };
+        let (mut submit, mut cancel) = (false, false);
+        let frame = egui::Frame::new()
+            .fill(SURFACE)
+            .stroke(egui::Stroke::new(1.0, RAISED_BORDER))
+            .corner_radius(12.0)
+            .inner_margin(20.0);
+        let modal = egui::Modal::new(egui::Id::unique("pin_prompt")).frame(frame).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.horizontal(|ui| {
+                icon_tile(ui, Icon::Lock, ACCENT_SOFT, ACCENT_TILE);
+                title_block(ui, "Введите PIN-код", &format!("«{}» защищён PIN-кодом", p.name));
+            });
+            ui.add_space(10.0);
+            let edit = egui::TextEdit::singleline(&mut p.pin)
+                .password(true)
+                .hint_text("PIN-код")
+                .desired_width(f32::INFINITY)
+                .margin(egui::Margin::symmetric(12, 9))
+                .font(egui::TextStyle::Heading);
+            ui.add(edit).request_focus();
+            p.pin.retain(|c| c.is_ascii_digit());
+            p.pin.truncate(8);
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
+            if let Some(err) = &p.error {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(err).small().color(RED));
+            }
+            ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if button(ui, None, "Войти", Kind::Primary).clicked() {
+                    submit = true;
+                }
+                if button(ui, None, "Отмена", Kind::Ghost).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel || modal.should_close() {
+            self.pin_prompt = None;
+        } else if submit && !p.pin.is_empty() {
+            let p = self.pin_prompt.take().unwrap();
+            self.start_session(p.name, p.ticket, p.profile, Some(p.pin));
+        }
     }
 
     fn session_toolbar(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(view) = self.desktop.as_mut() else { return false };
         let mut disconnect = false;
-        egui::Panel::top("session_bar").show(ui, |ui| {
+        let bar = egui::Frame::new().fill(TOOLBAR).inner_margin(egui::Margin::symmetric(10, 6));
+        egui::Panel::top("session_bar").frame(bar).show(ui, |ui| {
             ui.horizontal(|ui| {
-                let icon = if view.profile == Profile::Game { "🎮" } else { "🖥" };
                 let status = view.shared.status.lock().unwrap().clone();
                 let connected = view.frame_size.is_some();
                 status_dot(ui, if connected { GREEN } else { YELLOW });
-                ui.label(egui::RichText::new(format!("{icon} {}", view.name)).strong()).on_hover_text(&status);
-                ui.label(egui::RichText::new(short_status(&status)).small().weak()).on_hover_text(&status);
-
-                ui.separator();
-                for (tool, label, tip) in [
-                    (Tool::Control, "🖱", "Управление удалённым ПК"),
-                    (Tool::Pen, "✏", "Рисовать: линии видны на удалённом экране и исчезают через секунду"),
-                    (Tool::Laser, "🔦", "Указка: красная точка на удалённом экране"),
-                ] {
-                    if ui.selectable_label(view.tool == tool, label).on_hover_text(tip).clicked() {
-                        view.tool = tool;
-                    }
+                ui.label(semibold(&view.name, 13.5)).on_hover_text(&status);
+                if view.profile == Profile::Game {
+                    icon(ui, Icon::Gamepad, MUTED, 16.0);
                 }
+                ui.label(muted(short_status(&status)).small()).on_hover_text(&status);
+                ui.add_space(6.0);
+
+                egui::Frame::new()
+                    .fill(BG)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .corner_radius(8.0)
+                    .inner_margin(2.0)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for (tool, ic, tip) in [
+                            (Tool::Control, Icon::Cursor, "Управление удалённым ПК"),
+                            (Tool::Pen, Icon::Pen, "Перо: линии видны на удалённом экране и исчезают через секунду"),
+                            (Tool::Laser, Icon::Laser, "Указка: красная точка на удалённом экране"),
+                        ] {
+                            let kind = if view.tool == tool { Kind::Active } else { Kind::Ghost };
+                            if button_sized(ui, Some(ic), "", kind, 26.0).on_hover_text(tip).clicked() {
+                                view.tool = tool;
+                            }
+                        }
+                    });
                 if view.tool == Tool::Pen {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     for (i, c) in annotate::COLORS.iter().enumerate() {
                         let color = Color32::from_rgb(c[0], c[1], c[2]);
-                        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
-                        ui.painter().circle_filled(rect.center(), if view.color == i { 7.0 } else { 5.0 }, color);
-                        if resp.clicked() {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+                        let r = if resp.hovered() { 7.5 } else { 7.0 };
+                        ui.painter().circle_filled(rect.center(), r, color);
+                        if view.color == i {
+                            ui.painter().circle_stroke(rect.center(), 9.5, egui::Stroke::new(1.5, TEXT));
+                        }
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             view.color = i;
                         }
                     }
+                    ui.spacing_mut().item_spacing.x = 8.0;
                 }
-                if view.tool != Tool::Control && ui.button("🧹").on_hover_text("Стереть всё").clicked() {
+                if view.tool != Tool::Control
+                    && button_sized(ui, Some(Icon::Eraser), "", Kind::Ghost, 28.0).on_hover_text("Стереть всё").clicked()
+                {
                     view.ink.apply(&DrawEvent::Clear, Instant::now());
                     let _ = view.out.send(ClientMsg::Draw(DrawEvent::Clear));
                 }
 
-                if view.shared.secure_desktop.load(Ordering::Relaxed) {
-                    ui.separator();
-                    ui.label(egui::RichText::new("🔒 экран блокировки").color(ACCENT)).on_hover_text(
-                        "Клавиши передаются как физические — пароль вводится как на обычной клавиатуре. Сначала кликните в поле пароля.",
-                    );
-                }
-                if let Some(notice) = view.shared.notice.lock().unwrap().as_deref() {
-                    ui.label(egui::RichText::new("🎮 нет геймпада").color(YELLOW)).on_hover_text(notice);
-                }
-                if let Some(g) = &view.game {
-                    let hint = if g.captured { "Ctrl+Alt+Shift+Q — отпустить мышь" } else { "клик по картинке — захват мыши" };
-                    ui.label(egui::RichText::new(hint).small().weak());
-                }
-
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("✕ Отключиться").clicked() {
+                    if button_sized(ui, Some(Icon::Close), "Отключиться", Kind::Danger, 28.0).clicked() {
                         disconnect = true;
                     }
-                    if ui.button("Во весь экран").on_hover_text("F11 — выйти").clicked() {
+                    if button_sized(ui, Some(Icon::Expand), "", Kind::Ghost, 28.0)
+                        .on_hover_text("Во весь экран (F11 — выйти)")
+                        .clicked()
+                    {
                         view.fullscreen = true;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    }
+                    if view.shared.secure_desktop.load(Ordering::Relaxed) {
+                        chip(ui, Icon::Lock, "Экран блокировки", YELLOW, YELLOW_TILE).on_hover_text(
+                            "Клавиши передаются как физические — пароль вводится как на обычной клавиатуре. Сначала кликните в поле пароля.",
+                        );
+                    }
+                    if let Some(notice) = view.shared.notice.lock().unwrap().as_deref() {
+                        chip(ui, Icon::Gamepad, "Нет геймпада", YELLOW, YELLOW_TILE).on_hover_text(notice);
+                    }
+                    if let Some(g) = &view.game {
+                        let hint = if g.captured { "Ctrl+Alt+Shift+Q — отпустить мышь" } else { "Клик по картинке — захват мыши" };
+                        ui.label(muted(hint).small());
                     }
                 });
             });
@@ -1077,48 +1381,60 @@ impl eframe::App for App {
             return;
         }
 
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.add_space(4.0);
+        let header = egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(16, 8));
+        egui::Panel::top("tabs").frame(header).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("🐼 Panda").strong().size(17.0));
-                ui.add_space(12.0);
-                ui.selectable_value(&mut self.tab, Tab::Hosts, "💻 Компьютеры");
-                ui.selectable_value(&mut self.tab, Tab::ThisPc, "🏠 Этот ПК");
+                icon(ui, Icon::Panda, TEXT, 22.0);
+                ui.label(semibold("Panda", 15.0));
+                ui.add_space(14.0);
+                segmented(
+                    ui,
+                    &mut self.tab,
+                    &[(Tab::Hosts, Icon::Devices, "Компьютеры"), (Tab::ThisPc, Icon::Laptop, "Этот ПК")],
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Where this PC stands, one glance from any tab.
                     let (text, color) = if config::service_installed() {
-                        ("доступ открыт всегда", GREEN)
+                        ("Доступ открыт всегда", GREEN)
                     } else if self.this_pc.online {
-                        ("доступ открыт", GREEN)
+                        ("Доступ открыт", GREEN)
                     } else {
-                        ("доступ закрыт", Color32::GRAY)
+                        ("Доступ закрыт", OFFLINE)
                     };
-                    if ui.add(egui::Button::new(egui::RichText::new(text).small()).frame(false)).clicked() {
+                    let resp = ui.add(egui::Label::new(muted(text).small()).sense(Sense::click()));
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         self.tab = Tab::ThisPc;
                     }
                     status_dot(ui, color);
-                    ui.label(egui::RichText::new("Этот ПК:").small().weak());
                 });
             });
-            ui.add_space(2.0);
         });
         if let Some((is_err, text)) = self.message.clone() {
-            egui::Panel::bottom("message").show(ui, |ui| {
+            let bar = egui::Frame::new().fill(SURFACE).inner_margin(egui::Margin::symmetric(16, 6));
+            egui::Panel::bottom("message").frame(bar).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(if is_err { RED } else { GREEN }, text);
+                    status_dot(ui, if is_err { RED } else { GREEN });
+                    ui.label(egui::RichText::new(text).color(if is_err { RED } else { TEXT }));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").clicked() {
+                        if button_sized(ui, Some(Icon::Close), "", Kind::Ghost, 24.0).clicked() {
                             self.message = None;
                         }
                     });
                 });
             });
         }
-        egui::CentralPanel::default_margins().show(ui, |ui| match self.tab {
+        let body = egui::Frame::new().fill(BG).inner_margin(egui::Margin { left: 16, right: 16, top: 16, bottom: 10 });
+        egui::CentralPanel::no_frame().frame(body).show(ui, |ui| match self.tab {
             Tab::Hosts => self.computers_tab(ui),
-            Tab::ThisPc => self.this_pc_tab(ui),
+            Tab::ThisPc => egui::ScrollArea::vertical().show(ui, |ui| self.this_pc_tab(ui)).inner,
         });
+        self.pin_dialog(&ui.ctx().clone());
     }
+}
+
+/// Where a new service PIN waits for the elevated step that applies it (and deletes the file).
+fn pin_file() -> std::path::PathBuf {
+    config::user_dir().join("pin-change.tmp")
 }
 
 fn exe_mtime() -> Option<std::time::SystemTime> {
@@ -1127,37 +1443,293 @@ fn exe_mtime() -> Option<std::time::SystemTime> {
 
 // ---------- look ----------
 
-const GREEN: Color32 = Color32::from_rgb(52, 199, 89);
-const YELLOW: Color32 = Color32::from_rgb(255, 204, 0);
-const RED: Color32 = Color32::from_rgb(255, 99, 88);
-const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
+const BG: Color32 = Color32::from_rgb(0x0E, 0x10, 0x14);
+const SURFACE: Color32 = Color32::from_rgb(0x16, 0x19, 0x20);
+const TOOLBAR: Color32 = Color32::from_rgb(0x12, 0x15, 0x1B);
+const BORDER: Color32 = Color32::from_rgb(0x22, 0x27, 0x31);
+const RAISED: Color32 = Color32::from_rgb(0x1D, 0x21, 0x2A);
+const RAISED_BORDER: Color32 = Color32::from_rgb(0x2A, 0x30, 0x3B);
+const HOVER: Color32 = Color32::from_rgb(0x26, 0x2B, 0x36);
+const TEXT: Color32 = Color32::from_rgb(0xE9, 0xEC, 0xF1);
+const SOFT: Color32 = Color32::from_rgb(0xC9, 0xCE, 0xD6);
+const MUTED: Color32 = Color32::from_rgb(0x9B, 0xA3, 0xAF);
+const OFFLINE: Color32 = Color32::from_rgb(0x5C, 0x63, 0x70);
+const ACCENT: Color32 = Color32::from_rgb(0x33, 0x66, 0xE6);
+const ACCENT_HOVER: Color32 = Color32::from_rgb(0x44, 0x76, 0xF0);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(0x8F, 0xB0, 0xFF);
+const ACCENT_TILE: Color32 = Color32::from_rgb(0x1A, 0x25, 0x45);
+const GREEN: Color32 = Color32::from_rgb(0x3D, 0xD6, 0x8C);
+const GREEN_TILE: Color32 = Color32::from_rgb(0x14, 0x30, 0x1F);
+const YELLOW: Color32 = Color32::from_rgb(0xFF, 0xD4, 0x3B);
+const YELLOW_TILE: Color32 = Color32::from_rgb(0x2E, 0x26, 0x14);
+const RED: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
+const DANGER_FILL: Color32 = Color32::from_rgb(0x3A, 0x1D, 0x22);
+const DANGER_HOVER: Color32 = Color32::from_rgb(0x4A, 0x23, 0x29);
+const DANGER_TEXT: Color32 = Color32::from_rgb(0xFF, 0x8A, 0x8A);
+
+const SEMIBOLD: &str = "semibold";
 
 fn apply_style(ctx: &egui::Context) {
-    ctx.set_visuals(egui::Visuals::dark());
+    install_fonts(ctx);
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = BG;
+    v.window_fill = SURFACE;
+    v.extreme_bg_color = BG;
+    v.faint_bg_color = SURFACE;
+    v.window_stroke = egui::Stroke::new(1.0, RAISED_BORDER);
+    v.window_corner_radius = 10.into();
+    v.menu_corner_radius = 10.into();
+    v.selection.bg_fill = ACCENT;
+    v.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    v.hyperlink_color = ACCENT_SOFT;
+    v.weak_text_color = Some(MUTED);
+    let w = &mut v.widgets;
+    for (state, fill, stroke, fg) in [
+        (&mut w.noninteractive, SURFACE, BORDER, TEXT),
+        (&mut w.inactive, RAISED, RAISED_BORDER, SOFT),
+        (&mut w.hovered, HOVER, Color32::from_rgb(0x36, 0x3D, 0x4A), TEXT),
+        (&mut w.active, Color32::from_rgb(0x2E, 0x34, 0x40), Color32::from_rgb(0x3E, 0x46, 0x55), TEXT),
+        (&mut w.open, HOVER, RAISED_BORDER, TEXT),
+    ] {
+        state.bg_fill = fill;
+        state.weak_bg_fill = fill;
+        state.bg_stroke = egui::Stroke::new(1.0, stroke);
+        state.fg_stroke = egui::Stroke::new(1.0, fg);
+        state.corner_radius = 8.into();
+        state.expansion = 0.0;
+    }
+    ctx.set_visuals(v);
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        style.spacing.button_padding = Vec2::new(10.0, 4.0);
+        style.spacing.button_padding = Vec2::new(12.0, 6.0);
+        style.spacing.interact_size.y = 30.0;
+        style.spacing.menu_margin = egui::Margin::same(6);
+        use egui::{FontFamily, FontId, TextStyle};
+        style.text_styles = [
+            (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
+            (TextStyle::Heading, FontId::new(18.0, FontFamily::Name(SEMIBOLD.into()))),
+            (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        ]
+        .into();
     });
 }
 
-fn primary_button(text: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(text).color(Color32::WHITE)).fill(ACCENT)
+/// Segoe UI (regular and semibold) and Cascadia Mono from the system, egui's own fonts as fallback.
+fn install_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontDefinitions, FontFamily};
+    let mut fonts = FontDefinitions::default();
+    let dir =
+        std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts");
+    let mut load = |name: &str, file: &str| {
+        let data = std::fs::read(dir.join(file)).ok()?;
+        fonts.font_data.insert(name.into(), Arc::new(FontData::from_owned(data)));
+        Some(name.to_string())
+    };
+    let regular = load("segoe", "segoeui.ttf");
+    let semibold = load("segoe-semibold", "seguisb.ttf");
+    let mono = load("cascadia", "CascadiaMono.ttf").or_else(|| load("consolas", "consola.ttf"));
+    let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+    if let Some(r) = &regular {
+        proportional.insert(0, r.clone());
+    }
+    let mut strong: Vec<String> = semibold.into_iter().chain(proportional.iter().cloned()).collect();
+    strong.dedup();
+    fonts.families.insert(FontFamily::Name(SEMIBOLD.into()), strong);
+    if let Some(m) = mono {
+        fonts.families.entry(FontFamily::Monospace).or_default().insert(0, m);
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn semibold(text: impl Into<String>, size: f32) -> egui::RichText {
+    egui::RichText::new(text).family(egui::FontFamily::Name(SEMIBOLD.into())).size(size).color(TEXT)
+}
+
+fn muted(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).color(MUTED)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// The main action: accent fill.
+    Primary,
+    /// Raised, bordered.
+    Secondary,
+    /// No background until hovered.
+    Ghost,
+    /// Selected tool.
+    Active,
+    /// Selected tab of a segmented control.
+    Tab,
+    Danger,
+}
+
+fn button(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, kind: Kind) -> egui::Response {
+    button_sized(ui, icon, text, kind, 32.0)
+}
+
+fn small_button(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, kind: Kind) -> egui::Response {
+    button_sized(ui, icon, text, kind, 26.0)
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: Icon, tip: &str, kind: Kind) -> egui::Response {
+    button_sized(ui, Some(icon), "", kind, 32.0).on_hover_text(tip)
+}
+
+/// The app's button: optional leading icon, text, painted in one of the `Kind` styles.
+fn button_sized(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, kind: Kind, height: f32) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let size = if height < 28.0 { 12.5 } else { 13.5 };
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), Color32::PLACEHOLDER);
+    let icon_size = if height < 28.0 { 14.0 } else { 16.0 };
+    let icon_w = if icon.is_some() { icon_size } else { 0.0 };
+    let gap = if icon.is_some() && !text.is_empty() { 7.0 } else { 0.0 };
+    let pad = if text.is_empty() {
+        (height - icon_size) / 2.0
+    } else if height < 28.0 {
+        9.0
+    } else {
+        12.0
+    };
+    let width = pad * 2.0 + icon_w + gap + galley.size().x;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hot = enabled && (resp.hovered() || resp.has_focus());
+        let none = egui::Stroke::NONE;
+        let (fill, stroke, fg) = match kind {
+            Kind::Primary => (if hot { ACCENT_HOVER } else { ACCENT }, none, Color32::WHITE),
+            Kind::Secondary => {
+                (if hot { HOVER } else { RAISED }, egui::Stroke::new(1.0, RAISED_BORDER), if hot { TEXT } else { SOFT })
+            }
+            Kind::Ghost => (if hot { HOVER } else { Color32::TRANSPARENT }, none, if hot { TEXT } else { MUTED }),
+            Kind::Active => (ACCENT, none, Color32::WHITE),
+            Kind::Tab => (HOVER, none, TEXT),
+            Kind::Danger => (if hot { DANGER_HOVER } else { DANGER_FILL }, none, DANGER_TEXT),
+        };
+        let (fill, fg) = if enabled { (fill, fg) } else { (fill.gamma_multiply(0.5), fg.gamma_multiply(0.45)) };
+        let radius = if height < 30.0 { 6.0 } else { 8.0 };
+        ui.painter().rect(rect, radius, fill, stroke, egui::StrokeKind::Inside);
+        let mut x = rect.min.x + pad;
+        if let Some(icon) = icon {
+            let r = Rect::from_min_size(Pos2::new(x, rect.center().y - icon_size / 2.0), Vec2::splat(icon_size));
+            icons::paint(ui, icon, r, icon_size, fg);
+            x += icon_size + gap;
+        }
+        ui.painter().galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley, fg);
+    }
+    if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
+}
+
+/// A full-width row of a popup menu.
+fn menu_item(ui: &mut egui::Ui, icon: Icon, text: &str, danger: bool) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    let hot = enabled && resp.hovered();
+    if hot {
+        ui.painter().rect_filled(rect, 6.0, HOVER);
+    }
+    let color = match (enabled, danger) {
+        (false, _) => OFFLINE,
+        (true, true) => DANGER_TEXT,
+        (true, false) => {
+            if hot {
+                TEXT
+            } else {
+                SOFT
+            }
+        }
+    };
+    let icon_rect = Rect::from_min_size(Pos2::new(rect.min.x + 8.0, rect.center().y - 8.0), Vec2::splat(16.0));
+    icons::paint(ui, icon, icon_rect, 16.0, color);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), egui::FontId::proportional(13.5), color);
+    ui.painter().galley(Pos2::new(rect.min.x + 34.0, rect.center().y - galley.size().y / 2.0), galley, color);
+    if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
+}
+
+/// Tabs as a segmented control.
+fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, items: &[(T, Icon, &str)]) {
+    egui::Frame::new().fill(SURFACE).stroke(egui::Stroke::new(1.0, BORDER)).corner_radius(9.0).inner_margin(3.0).show(
+        ui,
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for &(v, icon, label) in items {
+                let kind = if *value == v { Kind::Tab } else { Kind::Ghost };
+                if button_sized(ui, Some(icon), label, kind, 28.0).clicked() {
+                    *value = v;
+                }
+            }
+        },
+    );
+}
+
+fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(36.0, 20.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+    let track = if *on { ACCENT } else { Color32::from_rgb(0x3A, 0x41, 0x4E) };
+    ui.painter().rect_filled(rect, 10.0, track);
+    let x = egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), t);
+    ui.painter().circle_filled(Pos2::new(x, rect.center().y), 7.0, Color32::WHITE);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn icon(ui: &mut egui::Ui, icon: Icon, color: Color32, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    icons::paint(ui, icon, rect, size, color);
+}
+
+/// A 40-point rounded square with a big icon: the state of a card at a glance.
+fn icon_tile(ui: &mut egui::Ui, icon: Icon, fg: Color32, bg: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+    ui.painter().rect_filled(rect, 10.0, bg);
+    icons::paint(ui, icon, rect, 22.0, fg);
+}
+
+fn title_block(ui: &mut egui::Ui, title: &str, sub: &str) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.label(semibold(title, 14.0));
+        ui.label(muted(sub).small());
+    });
+}
+
+/// A small coloured badge with an icon (lock screen, no gamepad).
+fn chip(ui: &mut egui::Ui, icon: Icon, text: &str, fg: Color32, bg: Color32) -> egui::Response {
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                self::icon(ui, icon, fg, 14.0);
+                ui.label(egui::RichText::new(text).small().color(fg));
+            });
+        })
+        .response
 }
 
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).corner_radius(8.0).inner_margin(10.0).show(
-        ui,
-        |ui| {
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
-        },
-    );
+        });
     ui.add_space(4.0);
 }
 
 fn status_dot(ui: &mut egui::Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-    ui.painter().circle_filled(rect.center(), 5.0, color);
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.5, color);
 }
 
 /// "P2P напрямую, 2 мс · 58 к/с · потери 0% · …" → "P2P · 2 мс · 58 к/с".

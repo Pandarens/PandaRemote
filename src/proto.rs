@@ -67,6 +67,8 @@ pub enum ClientMsg {
         frames: u32,
         lost: u32,
     },
+    /// Answer to `HostMsg::PinRequired`.
+    Pin(String),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -79,6 +81,8 @@ pub enum HostMsg {
         ok: bool,
         reason: String,
     },
+    /// The ticket was right, but this PC also wants its PIN (answer: `ClientMsg::Pin`).
+    PinRequired,
     StreamInfo {
         width: u32,
         height: u32,

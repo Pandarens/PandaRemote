@@ -15,7 +15,7 @@ mod overlay;
 mod session;
 
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -27,7 +27,7 @@ use iroh::{
 };
 
 use crate::{
-    config::{self, HostConfig},
+    config::{self, HostConfig, PinHash},
     proto::{self, ClientMsg, HostMsg, PROTOCOL_VERSION},
     ticket::Ticket,
 };
@@ -44,7 +44,7 @@ impl Host {
         let endpoint = proto::bind_endpoint(config::host_key()?).await?;
         let id = endpoint.id();
         let ticket = Ticket { host_id: id, secret: cfg.access_secret };
-        let handler = Handler { cfg: Arc::new(cfg), id };
+        let handler = Handler { cfg: Arc::new(cfg), id, pin_guard: Arc::default() };
         let router = Router::builder(endpoint).accept(proto::ALPN, handler).accept(proto::PING_ALPN, Ping).spawn();
         Ok(Host { router, ticket })
     }
@@ -79,6 +79,41 @@ impl ProtocolHandler for Ping {
 struct Handler {
     cfg: Arc<HostConfig>,
     id: EndpointId,
+    pin_guard: Arc<PinGuard>,
+}
+
+/// Wrong PINs in a row before PIN entry is locked for a while.
+const PIN_TRIES: u32 = 5;
+const PIN_LOCKOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Stops PIN guessing: a few tries, then a lockout for everyone (failures, lockout end).
+#[derive(Default)]
+struct PinGuard(Mutex<(u32, Option<Instant>)>);
+
+impl PinGuard {
+    fn check(&self, pin: &PinHash, entered: &str) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap();
+        if let Some(until) = state.1 {
+            let left = until.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                return Err(format!(
+                    "слишком много неверных PIN-кодов, попробуйте через {} мин",
+                    left.as_secs() / 60 + 1
+                ));
+            }
+            *state = (0, None);
+        }
+        if pin.matches(entered) {
+            state.0 = 0;
+            return Ok(());
+        }
+        state.0 += 1;
+        if state.0 >= PIN_TRIES {
+            state.1 = Some(Instant::now() + PIN_LOCKOUT);
+            return Err(format!("неверный PIN-код; вход заблокирован на {} мин", PIN_LOCKOUT.as_secs() / 60));
+        }
+        Err(format!("неверный PIN-код, осталось попыток: {}", PIN_TRIES - state.0))
+    }
 }
 
 // Manual impl so the access secret never ends up in logs.
@@ -115,17 +150,28 @@ impl Handler {
 
         let expected = proto::auth_mac(&self.cfg.access_secret, &nonce, client_id, self.id);
         // blake3::Hash equality is constant-time.
-        let reject = if expected != blake3::Hash::from_bytes(mac) {
-            Some("неверный ключ доступа")
+        let mut reject = if expected != blake3::Hash::from_bytes(mac) {
+            Some("неверный ключ доступа".to_string())
         } else if version != PROTOCOL_VERSION {
-            Some("несовместимая версия протокола")
+            Some("несовместимая версия протокола".to_string())
         } else {
             None
         };
+        // Re-read on every connection, so a new PIN applies without restarting the host.
+        let pin = HostConfig::load().ok().flatten().and_then(|c| c.pin);
+        if reject.is_none()
+            && let Some(pin) = pin
+        {
+            proto::write_msg(&mut send, &HostMsg::PinRequired).await?;
+            let ClientMsg::Pin(entered) = proto::read_msg(&mut recv).await? else {
+                bail!("expected Pin");
+            };
+            reject = self.pin_guard.check(&pin, &entered).err();
+        }
         if let Some(reason) = reject {
-            config::journal(&cid, &client_name, "auth_failed", reason);
+            config::journal(&cid, &client_name, "auth_failed", &reason);
             tokio::time::sleep(Duration::from_secs(2)).await;
-            proto::write_msg(&mut send, &HostMsg::AuthResult { ok: false, reason: reason.into() }).await?;
+            proto::write_msg(&mut send, &HostMsg::AuthResult { ok: false, reason }).await?;
             send.finish()?;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
             return Ok(());

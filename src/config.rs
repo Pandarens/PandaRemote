@@ -127,17 +127,28 @@ pub struct HostConfig {
     pub name: String,
     #[serde(with = "hex32")]
     pub access_secret: [u8; 32],
+    /// Asked after the ticket when set: a ticket alone is then not enough to get in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<PinHash>,
 }
 
 impl HostConfig {
     pub fn load_or_create() -> Result<Self> {
-        let p = host_path("host.json")?;
-        if let Ok(text) = fs::read_to_string(&p) {
-            return serde_json::from_str(&text).with_context(|| format!("parse {}", p.display()));
+        if let Some(cfg) = Self::load()? {
+            return Ok(cfg);
         }
-        let cfg = HostConfig { name: machine_name(), access_secret: random_bytes() };
+        let cfg = HostConfig { name: machine_name(), access_secret: random_bytes(), pin: None };
         cfg.save()?;
         Ok(cfg)
+    }
+
+    /// The saved settings, without creating them.
+    pub fn load() -> Result<Option<Self>> {
+        let p = host_path("host.json")?;
+        match fs::read_to_string(&p) {
+            Ok(text) => Ok(Some(serde_json::from_str(&text).with_context(|| format!("parse {}", p.display()))?)),
+            Err(_) => Ok(None),
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -149,6 +160,49 @@ impl HostConfig {
         self.access_secret = random_bytes();
         self.save()
     }
+
+    /// Sets (or with `None` removes) the PIN.
+    pub fn set_pin(&mut self, pin: Option<&str>) -> Result<()> {
+        if let Some(pin) = pin {
+            anyhow::ensure!(valid_pin(pin), "PIN-код — от 4 до 8 цифр");
+        }
+        self.pin = pin.map(PinHash::new);
+        self.save()
+    }
+}
+
+pub fn valid_pin(pin: &str) -> bool {
+    (4..=8).contains(&pin.len()) && pin.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A PIN kept as a salted BLAKE3 hash.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PinHash {
+    #[serde(with = "hex32")]
+    salt: [u8; 32],
+    #[serde(with = "hex32")]
+    hash: [u8; 32],
+}
+
+impl PinHash {
+    fn new(pin: &str) -> Self {
+        let salt = random_bytes();
+        PinHash { salt, hash: *blake3::keyed_hash(&salt, pin.as_bytes()).as_bytes() }
+    }
+
+    pub fn matches(&self, pin: &str) -> bool {
+        // blake3::Hash equality is constant-time.
+        blake3::keyed_hash(&self.salt, pin.as_bytes()) == blake3::Hash::from_bytes(self.hash)
+    }
+}
+
+/// This user's own copy of the host files. The service runs on a copy of them made at install time, so
+/// they give the ticket and the PIN state without administrator rights.
+pub fn user_host() -> Option<(iroh::EndpointId, HostConfig)> {
+    let dir = user_dir();
+    let key: [u8; 32] = fs::read(dir.join("host.key")).ok()?.try_into().ok()?;
+    let cfg = serde_json::from_str(&fs::read_to_string(dir.join("host.json")).ok()?).ok()?;
+    Some((SecretKey::from_bytes(&key).public(), cfg))
 }
 
 mod hex32 {

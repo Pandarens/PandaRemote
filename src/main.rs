@@ -6,6 +6,7 @@ mod client;
 mod config;
 mod gui;
 mod host;
+mod icons;
 mod media;
 mod proto;
 #[cfg(windows)]
@@ -48,6 +49,8 @@ enum Command {
     },
     /// Показать билет подключения к этому ПК
     Ticket,
+    /// Задать PIN-код, который спрашивается после билета (4–8 цифр), или `off` — убрать
+    Pin { pin: String },
     /// Открыть окно сеанса (рабочий стол или игра)
     Connect {
         ticket: String,
@@ -84,6 +87,9 @@ enum Command {
         seconds: u64,
         #[arg(long)]
         game: bool,
+        /// PIN-код, если компьютер его спрашивает
+        #[arg(long)]
+        pin: Option<String>,
         /// Через 2 с сдвинуть мышь хоста относительным движением и вернуть обратно (проверка ввода)
         #[arg(long, hide = true)]
         nudge: bool,
@@ -104,6 +110,25 @@ enum ServiceAction {
     },
     /// Остановить и удалить службу (от имени администратора)
     Uninstall {
+        #[arg(long, hide = true)]
+        result_file: Option<std::path::PathBuf>,
+    },
+    /// Скопировать билет службы в папку пользователя (для окна программы)
+    #[command(hide = true)]
+    SyncTicket {
+        /// Папка пользователя, куда положить копию
+        #[arg(long)]
+        to: std::path::PathBuf,
+        #[arg(long, hide = true)]
+        result_file: Option<std::path::PathBuf>,
+    },
+    /// Задать PIN-код службы из файла (пустой — убрать)
+    #[command(hide = true)]
+    SetPin {
+        #[arg(long)]
+        pin_file: std::path::PathBuf,
+        #[arg(long)]
+        to: std::path::PathBuf,
         #[arg(long, hide = true)]
         result_file: Option<std::path::PathBuf>,
     },
@@ -170,6 +195,18 @@ fn main() -> Result<()> {
             println!("{}", t.encode());
             Ok(())
         }
+        Some(Command::Pin { pin }) => {
+            let pin = (pin != "off").then_some(pin);
+            let mut cfg = config::HostConfig::load_or_create().map_err(service_files_hint)?;
+            cfg.set_pin(pin.as_deref())?;
+            #[cfg(windows)]
+            if config::host_dir() == config::machine_dir() {
+                // The service's files changed: refresh this user's copy the app reads.
+                service::sync_user_copy(&config::user_dir())?;
+            }
+            println!("{}", if pin.is_some() { "PIN-код задан." } else { "PIN-код убран." });
+            Ok(())
+        }
         Some(Command::ReleaseKeygen { out }) => {
             let key = iroh::SecretKey::generate();
             std::fs::write(&out, data_encoding::HEXLOWER.encode(&key.to_bytes()))?;
@@ -232,6 +269,12 @@ fn main() -> Result<()> {
             ServiceAction::Uninstall { result_file } => {
                 service::report(result_file, service::uninstall(), || println!("Служба удалена."))
             }
+            ServiceAction::SyncTicket { to, result_file } => {
+                service::report(result_file, service::sync_user_copy(&to), || {})
+            }
+            ServiceAction::SetPin { pin_file, to, result_file } => {
+                service::report(result_file, service::set_pin(&pin_file, &to), || println!("PIN-код службы обновлён."))
+            }
             ServiceAction::Status => {
                 match service::status() {
                     Some(state) => println!("Служба: {state:?}"),
@@ -272,10 +315,10 @@ fn main() -> Result<()> {
             Ok(())
         }),
         Some(Command::BenchEncoder { sw, fps }) => bench_encoder(!sw, fps),
-        Some(Command::Probe { ticket, out, seconds, game, nudge, actions }) => rt.block_on(async {
+        Some(Command::Probe { ticket, out, seconds, game, pin, nudge, actions }) => rt.block_on(async {
             let ticket = ticket::Ticket::decode(&ticket)?;
             let started = std::time::Instant::now();
-            let session = client::connect(&ticket, profile(game)).await?;
+            let session = client::connect(&ticket, profile(game), pin.as_deref()).await?;
             println!(
                 "Подключено к «{}» за {:?} ({})",
                 session.host_name,

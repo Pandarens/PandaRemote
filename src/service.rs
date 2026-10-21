@@ -230,6 +230,27 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Copies the service's host files into a user's directory `to` (the elevated copy may run as another
+/// account, so the app names its own), so the app can show the ticket and the PIN state without admin rights.
+pub fn sync_user_copy(to: &std::path::Path) -> Result<()> {
+    let from = config::machine_dir();
+    std::fs::create_dir_all(to).with_context(|| format!("create {}", to.display()))?;
+    for name in config::HOST_FILES {
+        std::fs::copy(from.join(name), to.join(name)).with_context(|| format!("copy {name}"))?;
+    }
+    Ok(())
+}
+
+/// Sets the service's PIN from `pin_file` (empty: no PIN), deletes the file and refreshes the copy in `to`.
+pub fn set_pin(pin_file: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    let pin = std::fs::read_to_string(pin_file).with_context(|| format!("read {}", pin_file.display()));
+    let _ = std::fs::remove_file(pin_file);
+    let pin = pin?;
+    let pin = pin.trim();
+    config::HostConfig::load_or_create()?.set_pin((!pin.is_empty()).then_some(pin))?;
+    sync_user_copy(to)
+}
+
 /// Finishes an install/uninstall: prints on success, and mirrors the outcome into `result_file`
 /// for [`run_elevated`] (the elevated process has no console the GUI could read).
 pub fn report(result_file: Option<std::path::PathBuf>, result: Result<()>, on_ok: impl FnOnce()) -> Result<()> {

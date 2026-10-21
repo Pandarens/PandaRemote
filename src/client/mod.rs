@@ -36,7 +36,19 @@ pub struct Session {
     pub host_name: String,
 }
 
-pub async fn connect(ticket: &Ticket, profile: Profile) -> Result<Session> {
+/// The host asks for a PIN: none was given (`None`), or it refused the one given (the reason).
+#[derive(Debug)]
+pub struct PinError(pub Option<String>);
+
+impl std::fmt::Display for PinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_deref().unwrap_or("нужен PIN-код"))
+    }
+}
+
+impl std::error::Error for PinError {}
+
+pub async fn connect(ticket: &Ticket, profile: Profile, pin: Option<&str>) -> Result<Session> {
     let ep = endpoint().await?;
     let conn = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(ticket.host_id, proto::ALPN))
         .await
@@ -51,7 +63,19 @@ pub async fn connect(ticket: &Ticket, profile: Profile) -> Result<Session> {
     };
     let mac = proto::auth_mac(&ticket.secret, &nonce, ep.id(), ticket.host_id);
     proto::write_msg(&mut send, &ClientMsg::Auth { mac: *mac.as_bytes() }).await?;
-    match proto::read_msg(&mut recv).await? {
+    let mut reply = proto::read_msg(&mut recv).await?;
+    if let HostMsg::PinRequired = reply {
+        let Some(pin) = pin else {
+            conn.close(0u32.into(), b"pin");
+            return Err(PinError(None).into());
+        };
+        proto::write_msg(&mut send, &ClientMsg::Pin(pin.to_string())).await?;
+        reply = proto::read_msg(&mut recv).await?;
+        if let HostMsg::AuthResult { ok: false, reason } = reply {
+            return Err(PinError(Some(reason)).into());
+        }
+    }
+    match reply {
         HostMsg::AuthResult { ok: true, .. } => {}
         HostMsg::AuthResult { ok: false, reason } => bail!("хост отказал: {reason}"),
         _ => bail!("unexpected message from host"),
