@@ -9,10 +9,9 @@ use std::{
 };
 
 use anyhow::Result;
-use openh264::{decoder::Decoder, formats::YUVSource};
 use tokio::sync::mpsc;
 
-use super::{Session, audio};
+use super::{Session, audio, decoder};
 use crate::{
     media::{
         audio as audio_pkt,
@@ -21,19 +20,31 @@ use crate::{
     proto::{self, ClientMsg, HostMsg},
 };
 
-pub struct RgbaFrame {
+/// Decoded picture in NV12: full-resolution luma plus interleaved half-resolution chroma, tightly packed.
+/// The GUI converts it to RGB on the GPU.
+pub struct VideoFrame {
     pub width: usize,
     pub height: usize,
-    pub pixels: Vec<u8>,
+    pub y: Vec<u8>,
+    pub uv: Vec<u8>,
+}
+
+impl VideoFrame {
+    pub fn to_rgba(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.width * self.height * 4];
+        super::decoder::nv12_to_rgba(&self.y, &self.uv, self.width, self.width, self.height, &mut out);
+        out
+    }
 }
 
 /// State shared between the network tasks and the GUI.
 #[derive(Default)]
 pub struct Shared {
-    pub frame: Mutex<Option<RgbaFrame>>,
+    pub frame: Mutex<Option<VideoFrame>>,
     pub status: Mutex<String>,
     /// Problem worth showing next to the status (e.g. no virtual gamepad on the host).
     pub notice: Mutex<Option<String>>,
+    pub decoder: Mutex<String>,
     pub decoded: AtomicU32,
     assembled: AtomicU32,
     lost: AtomicU32,
@@ -66,7 +77,7 @@ pub async fn run(
         let (shared, repaint, out_tx, resync) = (shared.clone(), repaint.clone(), out_tx.clone(), resync.clone());
         std::thread::Builder::new()
             .name("decoder".into())
-            .spawn(move || decode_loop(dec_rx, shared, out_tx, resync, repaint))?;
+            .spawn(move || decode_loop(dec_rx, shared, out_tx, resync, repaint, (width, height)))?;
     }
 
     let receive = async {
@@ -117,7 +128,11 @@ pub async fn run(
             let _ = out_tx.send(ClientMsg::Stats { frames, lost });
             let loss = if frames + lost > 0 { lost * 100 / (frames + lost) } else { 0 };
             *shared.status.lock().unwrap() =
-                format!("{} · {decoded} к/с · потери {loss}%{audio} · {encoder}", super::path_summary(&conn));
+                format!(
+                "{} · {decoded} к/с · потери {loss}%{audio} · кодер: {encoder} · декодер: {}",
+                super::path_summary(&conn),
+                shared.decoder.lock().unwrap()
+            );
             repaint();
         }
     };
@@ -136,14 +151,18 @@ fn decode_loop(
     out_tx: mpsc::UnboundedSender<ClientMsg>,
     resync: Arc<AtomicBool>,
     repaint: Repaint,
+    (width, height): (u32, u32),
 ) {
-    let mut decoder = match Decoder::new() {
+    // PANDA_DECODER=sw forces the software decoder (diagnostics).
+    let allow_hw = std::env::var("PANDA_DECODER").map_or(true, |v| v != "sw");
+    let mut decoder = match decoder::create(width, height, allow_hw) {
         Ok(d) => d,
         Err(e) => {
-            tracing::error!("H.264 decoder init failed: {e}");
+            tracing::error!("H.264 decoder init failed: {e:#}");
             return;
         }
     };
+    *shared.decoder.lock().unwrap() = decoder.name();
     // Until the first keyframe (and after any loss) P-frames would decode into garbage.
     let mut awaiting_key = true;
     let mut last_request: Option<Instant> = None;
@@ -163,17 +182,14 @@ fn decode_loop(
         }
         awaiting_key = false;
         match decoder.decode(&frame.data) {
-            Ok(Some(yuv)) => {
-                let (w, h) = yuv.dimensions();
-                let mut pixels = vec![0u8; w * h * 4];
-                yuv.write_rgba8(&mut pixels);
-                *shared.frame.lock().unwrap() = Some(RgbaFrame { width: w, height: h, pixels });
+            Ok(Some(picture)) => {
+                *shared.frame.lock().unwrap() = Some(picture);
                 shared.decoded.fetch_add(1, Ordering::Relaxed);
                 repaint();
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::debug!("decode error, requesting keyframe: {e}");
+                tracing::debug!("decode error, requesting keyframe: {e:#}");
                 awaiting_key = true;
                 request_key(&mut last_request);
             }

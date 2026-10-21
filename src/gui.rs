@@ -20,6 +20,7 @@ use crate::{
     host::Host,
     proto::{ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, Profile},
     ticket::Ticket,
+    yuv_render::{self, PendingFrame},
 };
 
 pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>) -> Result<()> {
@@ -32,7 +33,10 @@ pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>) -> Result<()> {
     eframe::run_native(
         "Panda Remote",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc.egui_ctx.clone(), rt, initial)))),
+        Box::new(move |cc| {
+            let gpu_video = yuv_render::init(cc.wgpu_render_state.as_ref());
+            Ok(Box::new(App::new(cc.egui_ctx.clone(), rt, initial, gpu_video)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -64,6 +68,8 @@ struct App {
 
     this_pc: ThisPc,
     desktop: Option<DesktopView>,
+    /// NV12 frames are drawn by a wgpu shader; otherwise converted to RGBA on the CPU.
+    gpu_video: bool,
 }
 
 struct ThisPc {
@@ -83,6 +89,8 @@ struct DesktopView {
     out: tmpsc::UnboundedSender<ClientMsg>,
     task: JoinHandle<()>,
     texture: Option<TextureHandle>,
+    pending: PendingFrame,
+    frame_size: Option<(usize, usize)>,
     last_pos: Option<(u16, u16)>,
     wheel: Vec2,
     fullscreen: bool,
@@ -106,7 +114,7 @@ impl Drop for GameInput {
 }
 
 impl App {
-    fn new(ctx: egui::Context, rt: Runtime, initial: Option<(Ticket, Profile)>) -> Self {
+    fn new(ctx: egui::Context, rt: Runtime, initial: Option<(Ticket, Profile)>, gpu_video: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut app = App {
             rt,
@@ -128,6 +136,7 @@ impl App {
                 journal_at: None,
             },
             desktop: None,
+            gpu_video,
         };
         if let Some((t, profile)) = initial {
             app.start_session("Удалённый ПК".into(), t.encode(), profile);
@@ -215,6 +224,8 @@ impl App {
             out: out_tx,
             task,
             texture: None,
+            pending: PendingFrame::default(),
+            frame_size: None,
             last_pos: None,
             wheel: Vec2::ZERO,
             fullscreen: false,
@@ -408,6 +419,7 @@ impl App {
     }
 
     fn desktop_view(&mut self, ui: &mut egui::Ui) {
+        let gpu_video = self.gpu_video;
         let Some(view) = self.desktop.as_mut() else { return };
         let mut disconnect = false;
 
@@ -444,21 +456,30 @@ impl App {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             ui.painter().rect_filled(ui.max_rect(), 0.0, Color32::BLACK);
             if let Some(frame) = view.shared.frame.lock().unwrap().take() {
-                let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.pixels);
-                match &mut view.texture {
-                    Some(t) => t.set(image, TextureOptions::LINEAR),
-                    None => view.texture = Some(ui.ctx().load_texture("remote", image, TextureOptions::LINEAR)),
+                view.frame_size = Some((frame.width, frame.height));
+                if gpu_video {
+                    *view.pending.lock().unwrap() = Some(frame);
+                } else {
+                    let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.to_rgba());
+                    match &mut view.texture {
+                        Some(t) => t.set(image, TextureOptions::LINEAR),
+                        None => view.texture = Some(ui.ctx().load_texture("remote", image, TextureOptions::LINEAR)),
+                    }
                 }
             }
-            let Some(tex) = &view.texture else {
+            let Some((fw, fh)) = view.frame_size else {
                 ui.centered_and_justified(|ui| ui.label(view.shared.status.lock().unwrap().clone()));
                 return;
             };
             let avail = ui.max_rect();
-            let size = tex.size_vec2();
+            let size = Vec2::new(fw as f32, fh as f32);
             let scale = (avail.width() / size.x).min(avail.height() / size.y);
             let rect = Rect::from_center_size(avail.center(), size * scale);
-            ui.painter().image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            if gpu_video {
+                yuv_render::paint(ui.painter(), rect, view.pending.clone());
+            } else if let Some(tex) = &view.texture {
+                ui.painter().image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            }
             let resp = ui.allocate_rect(rect, Sense::click_and_drag());
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Default);

@@ -8,6 +8,7 @@ mod host;
 mod media;
 mod proto;
 mod ticket;
+mod yuv_render;
 
 use std::sync::Arc;
 
@@ -133,7 +134,7 @@ fn main() -> Result<()> {
             let frame = shared.frame.lock().unwrap().take();
             match frame {
                 Some(f) => {
-                    xcap::image::RgbaImage::from_raw(f.width as u32, f.height as u32, f.pixels)
+                    xcap::image::RgbaImage::from_raw(f.width as u32, f.height as u32, f.to_rgba())
                         .ok_or_else(|| anyhow::anyhow!("bad frame"))?
                         .save(&out)?;
                     println!("Последний статус: {}", shared.status.lock().unwrap());
@@ -155,10 +156,12 @@ fn bench_encoder(hw: bool, fps: u32) -> Result<()> {
     let (w, h) = (1920u32, 1080u32);
     let mut enc = encoder::create(w, h, fps, 20_000_000, hw)?;
     println!("Энкодер: {}", enc.name());
-    let mut decoder = openh264::decoder::Decoder::new()?;
+    let mut decoders = [client::decoder::create(w, h, true)?, client::decoder::create(w, h, false)?];
+    let mut decode_times = [std::time::Duration::ZERO; 2];
+    let mut decoded_counts = [0u32; 2];
+    let mut decode_cpu = [std::time::Duration::ZERO; 2];
     let mut pixels = vec![0u8; (w * h * 4) as usize];
-    let (mut total, mut bytes, mut frames, mut keys, mut decoded) = (std::time::Duration::ZERO, 0usize, 0, 0, 0);
-    let mut decode_time = std::time::Duration::ZERO;
+    let (mut total, mut bytes, mut frames, mut keys) = (std::time::Duration::ZERO, 0usize, 0, 0);
     for i in 0..180u32 {
         // Moving gradient + a sliding white bar: realistic motion for the rate control.
         for y in 0..h {
@@ -178,20 +181,43 @@ fn bench_encoder(hw: bool, fps: u32) -> Result<()> {
             frames += 1;
             bytes += f.data.len();
             keys += f.keyframe as u32;
-            let t = std::time::Instant::now();
-            if let Some(yuv) = decoder.decode(&f.data)? {
-                let mut rgba = vec![0u8; (w * h * 4) as usize];
-                yuv.write_rgba8(&mut rgba);
-                decoded += 1;
+            for (k, dec) in decoders.iter_mut().enumerate() {
+                let (t, cpu) = (std::time::Instant::now(), thread_cpu_time());
+                if dec.decode(&f.data)?.is_some() {
+                    decoded_counts[k] += 1;
+                }
+                decode_times[k] += t.elapsed();
+                decode_cpu[k] += thread_cpu_time().saturating_sub(cpu);
             }
-            decode_time += t.elapsed();
         }
     }
     println!(
-        "180 кадров: {:.2} мс/кадр (с конвертацией), выход {frames} кадров, IDR {keys}, средний размер {} КБ, декодировано {decoded} ({:.2} мс/кадр с RGBA)",
+        "180 кадров: {:.2} мс/кадр (с конвертацией), выход {frames} кадров, IDR {keys}, средний размер {} КБ",
         total.as_secs_f64() * 1000.0 / 180.0,
         bytes / frames.max(1) / 1024,
-        decode_time.as_secs_f64() * 1000.0 / decoded.max(1) as f64
     );
+    for (k, dec) in decoders.iter().enumerate() {
+        println!(
+            "Декодер {}: {} кадров, {:.2} мс/кадр, из них CPU этого потока {:.2} мс (до NV12 в памяти)",
+            dec.name(),
+            decoded_counts[k],
+            decode_times[k].as_secs_f64() * 1000.0 / decoded_counts[k].max(1) as f64,
+            decode_cpu[k].as_secs_f64() * 1000.0 / decoded_counts[k].max(1) as f64
+        );
+    }
     Ok(())
+}
+
+/// CPU time consumed by the calling thread (Windows); zero elsewhere.
+fn thread_cpu_time() -> std::time::Duration {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::{Foundation::FILETIME, System::Threading::{GetCurrentThread, GetThreadTimes}};
+        let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        if GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u).is_ok() {
+            let t = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) * 100;
+            return std::time::Duration::from_nanos(t(k) + t(u));
+        }
+    }
+    std::time::Duration::ZERO
 }
