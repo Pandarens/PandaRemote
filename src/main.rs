@@ -57,6 +57,8 @@ enum Command {
     },
     /// Задать PIN-код, который спрашивается после билета (4–8 цифр), или `off` — убрать
     Pin { pin: String },
+    /// Свой relay-сервер вместо серверов n0 (например https://relay.example.com), `off` — обратно
+    Relay { url: String },
     /// Открыть окно сеанса (рабочий стол или игра)
     Connect {
         ticket: String,
@@ -267,6 +269,26 @@ fn main() -> Result<()> {
             }
             let ok: Vec<_> = client::decoder::supported().into_iter().map(|c| c.name()).collect();
             println!("Клиент попросит: {}", ok.join(", "));
+            Ok(())
+        }
+        Some(Command::Relay { url }) => {
+            let relay = (url != "off").then_some(url);
+            if let Some(u) = &relay {
+                u.parse::<iroh::RelayUrl>().with_context(|| format!("адрес relay-сервера: {u}"))?;
+            }
+            let mut cfg = config::HostConfig::load_or_create().map_err(service_files_hint)?;
+            cfg.relay = relay.clone();
+            cfg.save()?;
+            #[cfg(windows)]
+            if config::host_dir() == config::machine_dir() {
+                service::sync_user_copy(&config::user_dir())?;
+                service::restart()?;
+                println!("Служба перезапущена с новым relay.");
+            }
+            match relay {
+                Some(u) => println!("Relay: {u}. Хост в окне программы применит его после перезапуска Panda."),
+                None => println!("Relay: серверы n0 (по умолчанию)."),
+            }
             Ok(())
         }
         Some(Command::Pin { pin }) => {

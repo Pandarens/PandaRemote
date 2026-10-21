@@ -1,10 +1,11 @@
 //! Wire protocol: messages, length-prefixed framing and the auth MAC.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use iroh::{
-    Endpoint, EndpointId, SecretKey,
+    Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     endpoint::{QuicTransportConfig, RecvStream, SendStream, presets},
 };
+use iroh_mainline_address_lookup::DhtAddressLookup;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Single ALPN; the stream profile is chosen in [`ClientMsg::Hello`].
@@ -282,13 +283,27 @@ pub mod buttons {
     pub const Y: u16 = 0x8000;
 }
 
-/// Endpoint with the given identity, n0 address lookup + relays, and buffers sized for streaming.
-pub async fn bind_endpoint(key: SecretKey) -> Result<Endpoint> {
+/// Endpoint with the given identity and buffers sized for streaming. A PC is found by its key in two
+/// independent ways: n0's address service, and the BitTorrent Mainline DHT, which needs no server of
+/// ours or n0's. `relay`: an own relay server instead of n0's; it is published with the address, so only
+/// the host needs it. `PANDA_LOOKUP=dht` leaves only the DHT (to check that it works on its own).
+pub async fn bind_endpoint(key: SecretKey, relay: Option<&str>) -> Result<Endpoint> {
     let transport = QuicTransportConfig::builder()
         .datagram_receive_buffer_size(Some(8 * 1024 * 1024))
         .datagram_send_buffer_size(8 * 1024 * 1024)
         .build();
-    Ok(Endpoint::builder(presets::N0).secret_key(key).transport_config(transport).bind().await?)
+    let dht_only = std::env::var("PANDA_LOOKUP").is_ok_and(|v| v == "dht");
+    let mut builder = if dht_only {
+        Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Default)
+    } else {
+        Endpoint::builder(presets::N0)
+    };
+    builder = builder.secret_key(key).transport_config(transport).address_lookup(DhtAddressLookup::builder());
+    if let Some(url) = relay {
+        let url: RelayUrl = url.parse().with_context(|| format!("адрес relay-сервера: {url}"))?;
+        builder = builder.relay_mode(RelayMode::Custom(RelayMap::from_iter([url])));
+    }
+    Ok(builder.bind().await?)
 }
 
 pub async fn write_msg<T: Serialize>(send: &mut SendStream, msg: &T) -> Result<()> {

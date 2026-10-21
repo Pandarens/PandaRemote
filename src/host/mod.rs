@@ -44,7 +44,7 @@ impl Host {
     pub async fn start(cfg: HostConfig) -> Result<Self> {
         input::set_dpi_aware();
 
-        let endpoint = proto::bind_endpoint(config::host_key()?).await?;
+        let endpoint = proto::bind_endpoint(config::host_key()?, cfg.relay.as_deref()).await?;
         let id = endpoint.id();
         let ticket = Ticket { host_id: id, secret: cfg.access_secret };
         let handler = Handler { cfg: Arc::new(cfg), id, pin_guard: Arc::default() };

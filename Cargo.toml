@@ -36,6 +36,7 @@ xcap = "0.9"
 mp4 = "0.14"
 rfd = "0.16"
 tray-icon = "0.21"
+iroh-mainline-address-lookup = "0.6.1"
 
 [target."cfg(windows)".dependencies]
 tiny-skia = "0.12"

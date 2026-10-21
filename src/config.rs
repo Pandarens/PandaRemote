@@ -133,6 +133,9 @@ pub struct HostConfig {
     /// Secret of the view-only ticket (see the picture, no control), created when first asked for.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "hex32_opt")]
     pub view_secret: Option<[u8; 32]>,
+    /// Own relay server (e.g. `https://relay.example.com`) instead of n0's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 impl HostConfig {
@@ -140,7 +143,8 @@ impl HostConfig {
         if let Some(cfg) = Self::load()? {
             return Ok(cfg);
         }
-        let cfg = HostConfig { name: machine_name(), access_secret: random_bytes(), pin: None, view_secret: None };
+        let cfg =
+            HostConfig { name: machine_name(), access_secret: random_bytes(), pin: None, view_secret: None, relay: None };
         cfg.save()?;
         Ok(cfg)
     }

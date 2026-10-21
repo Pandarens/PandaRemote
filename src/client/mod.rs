@@ -27,7 +27,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 static ENDPOINT: OnceCell<Endpoint> = OnceCell::const_new();
 
 async fn endpoint() -> Result<&'static Endpoint> {
-    ENDPOINT.get_or_try_init(|| async { proto::bind_endpoint(config::client_key()?).await }).await
+    ENDPOINT.get_or_try_init(|| async { proto::bind_endpoint(config::client_key()?, None).await }).await
 }
 
 pub struct Session {
