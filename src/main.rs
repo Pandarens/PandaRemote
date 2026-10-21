@@ -34,6 +34,14 @@ enum Command {
     Connect { ticket: String },
     /// Показать журнал подключений к этому ПК
     Log,
+    /// Диагностика: скорость H.264-энкодера на синтетических кадрах 1080p
+    #[command(hide = true)]
+    BenchEncoder {
+        #[arg(long)]
+        sw: bool,
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
+    },
     /// Диагностика: подключиться к рабочему столу, принять видео и сохранить кадр в PNG
     Probe {
         ticket: String,
@@ -85,6 +93,7 @@ fn main() -> Result<()> {
             host.shutdown().await;
             Ok(())
         }),
+        Some(Command::BenchEncoder { sw, fps }) => bench_encoder(!sw, fps),
         Some(Command::Probe { ticket, out, seconds }) => rt.block_on(async {
             let ticket = ticket::Ticket::decode(&ticket)?;
             let started = std::time::Instant::now();
@@ -112,4 +121,44 @@ fn main() -> Result<()> {
             }
         }),
     }
+}
+
+fn bench_encoder(hw: bool, fps: u32) -> Result<()> {
+    use host::encoder::{self, Picture};
+    let (w, h) = (1920u32, 1080u32);
+    let mut enc = encoder::create(w, h, fps, 20_000_000, hw)?;
+    println!("Энкодер: {}", enc.name());
+    let mut decoder = openh264::decoder::Decoder::new()?;
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let (mut total, mut bytes, mut frames, mut keys, mut decoded) = (std::time::Duration::ZERO, 0usize, 0, 0, 0);
+    for i in 0..180u32 {
+        // Moving gradient + a sliding white bar: realistic motion for the rate control.
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                let bar = (x + i * 12) % w < 80;
+                pixels[o] = if bar { 255 } else { (x / 8 + i) as u8 };
+                pixels[o + 1] = if bar { 255 } else { (y / 4) as u8 };
+                pixels[o + 2] = if bar { 255 } else { (i * 3) as u8 };
+                pixels[o + 3] = 255;
+            }
+        }
+        let t = std::time::Instant::now();
+        let out = enc.encode(&Picture { pixels: &pixels, width: w, height: h, bgra: true }, i == 90)?;
+        total += t.elapsed();
+        for f in out {
+            frames += 1;
+            bytes += f.data.len();
+            keys += f.keyframe as u32;
+            if decoder.decode(&f.data)?.is_some() {
+                decoded += 1;
+            }
+        }
+    }
+    println!(
+        "180 кадров: {:.2} мс/кадр (с конвертацией), выход {frames} кадров, IDR {keys}, средний размер {} КБ, декодировано {decoded}",
+        total.as_secs_f64() * 1000.0 / 180.0,
+        bytes / frames.max(1) / 1024
+    );
+    Ok(())
 }

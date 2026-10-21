@@ -3,6 +3,7 @@
 
 mod capture;
 mod desktop;
+pub mod encoder;
 #[cfg(windows)]
 mod dxgi;
 mod input;
