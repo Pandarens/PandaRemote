@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 
 use super::{
     capture::{self, Control},
-    input,
+    gamepad, input,
 };
 use crate::proto::{self, ClientMsg, HostMsg, Profile};
 
@@ -27,13 +27,23 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
     }
     let start = start_rx.await??;
     tracing::info!(encoder = %start.encoder, profile = profile.name(), "stream started");
+    let (pad_tx, gamepad_error) = match profile {
+        Profile::Game => match gamepad::spawn() {
+            Ok(tx) => (Some(tx), None),
+            Err(e) => {
+                tracing::warn!("virtual gamepad unavailable: {e:#}");
+                (None, Some(format!("{e:#}")))
+            }
+        },
+        Profile::Desktop => (None, None),
+    };
     let info = HostMsg::StreamInfo {
         width: start.geometry.width,
         height: start.geometry.height,
         fps: profile.fps(),
         encoder: start.encoder,
         audio: false,
-        gamepad_error: Some("ещё не реализовано".into()),
+        gamepad_error,
     };
     proto::write_msg(&mut send, &info).await?;
 
@@ -45,6 +55,11 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
             match proto::read_msg::<ClientMsg>(&mut recv).await? {
                 ClientMsg::Input(ev) => {
                     let _ = input_tx.send(ev);
+                }
+                ClientMsg::Gamepad(state) => {
+                    if let Some(tx) = &pad_tx {
+                        let _ = tx.send(state);
+                    }
                 }
                 ClientMsg::RequestKeyframe => control.keyframe.store(true, Ordering::Relaxed),
                 ClientMsg::Stats { frames, lost } => {

@@ -11,6 +11,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 data-encoding = "2.11.1"
 directories = "6.0.0"
 eframe = "0.37"
+gilrs = "0.11"
 humantime = "2.4.0"
 iroh = "1.4"
 openh264 = "0.9"
@@ -25,4 +26,5 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 xcap = "0.9"
 
 [target."cfg(windows)".dependencies]
+vigem-client = "0.1"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

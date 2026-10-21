@@ -29,6 +29,8 @@ pub struct RgbaFrame {
 pub struct Shared {
     pub frame: Mutex<Option<RgbaFrame>>,
     pub status: Mutex<String>,
+    /// Problem worth showing next to the status (e.g. no virtual gamepad on the host).
+    pub notice: Mutex<Option<String>>,
     pub decoded: AtomicU32,
     assembled: AtomicU32,
     lost: AtomicU32,
@@ -44,9 +46,10 @@ pub async fn run(
     repaint: Repaint,
 ) -> Result<()> {
     let Session { conn, mut send, mut recv, .. } = session;
-    let HostMsg::StreamInfo { width, height, fps, encoder, .. } = proto::read_msg(&mut recv).await? else {
+    let HostMsg::StreamInfo { width, height, fps, encoder, gamepad_error, .. } = proto::read_msg(&mut recv).await? else {
         anyhow::bail!("expected StreamInfo");
     };
+    *shared.notice.lock().unwrap() = gamepad_error;
     tracing::info!(width, height, fps, %encoder, "stream info");
 
     // Decoding runs on its own thread; a full queue means the decoder fell behind,

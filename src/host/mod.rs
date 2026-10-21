@@ -3,6 +3,7 @@
 
 mod capture;
 pub mod encoder;
+mod gamepad;
 #[cfg(windows)]
 mod dxgi;
 mod input;

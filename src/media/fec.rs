@@ -61,7 +61,6 @@ pub fn packetize(frame_id: u32, data: &[u8], keyframe: bool, max_datagram: usize
 }
 
 pub struct Frame {
-    pub id: u32,
     pub keyframe: bool,
     pub data: Vec<u8>,
     /// Frames between the previous delivered one and this one were lost.
@@ -127,7 +126,7 @@ impl Reassembler {
         self.last_delivered = Some(id);
         // Anything older is now unusable.
         self.partial.retain(|&k, _| k > id);
-        Some(Frame { id, keyframe: p.keyframe, data, after_gap })
+        Some(Frame { keyframe: p.keyframe, data, after_gap })
     }
 
     fn drop_stale(&mut self, now: Instant) {

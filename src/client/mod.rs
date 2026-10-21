@@ -1,5 +1,6 @@
 //! Client side: dial a host by its key, authenticate, then run a streaming session.
 
+pub mod gamepad;
 pub mod viewer;
 
 use std::time::Duration;

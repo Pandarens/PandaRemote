@@ -1,8 +1,10 @@
 //! Desktop GUI (eframe/egui): saved hosts, remote-desktop viewer, "this PC" host panel.
 
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -13,7 +15,7 @@ use eframe::egui::{self, Color32, Pos2, Rect, Sense, TextureHandle, TextureOptio
 use tokio::{runtime::Runtime, sync::mpsc as tmpsc, task::JoinHandle};
 
 use crate::{
-    client::{self, viewer},
+    client::{self, gamepad, viewer},
     config::{self, HostConfig, JournalEntry, SavedHost},
     host::Host,
     proto::{ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, Profile},
@@ -84,6 +86,23 @@ struct DesktopView {
     last_pos: Option<(u16, u16)>,
     wheel: Vec2,
     fullscreen: bool,
+    /// Present in the game profile.
+    game: Option<GameInput>,
+}
+
+/// Game-profile input: captured pointer, raw mouse deltas, keys as scancodes, gamepad forwarding.
+struct GameInput {
+    captured: bool,
+    mods: egui::Modifiers,
+    pressed: HashSet<(u16, bool)>,
+    motion: Vec2,
+    pad_stop: Arc<AtomicBool>,
+}
+
+impl Drop for GameInput {
+    fn drop(&mut self) {
+        self.pad_stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl App {
@@ -183,6 +202,11 @@ impl App {
             .await;
             send(UiEvent::DesktopEnded(res.err().map(|e| format!("{e:#}"))));
         });
+        let game = (profile == Profile::Game).then(|| {
+            let pad_stop = Arc::new(AtomicBool::new(false));
+            gamepad::spawn(out_tx.clone(), pad_stop.clone());
+            GameInput { captured: false, mods: egui::Modifiers::default(), pressed: HashSet::new(), motion: Vec2::ZERO, pad_stop }
+        });
         self.message = None;
         self.desktop = Some(DesktopView {
             name,
@@ -194,6 +218,7 @@ impl App {
             last_pos: None,
             wheel: Vec2::ZERO,
             fullscreen: false,
+            game,
         });
     }
 
@@ -389,8 +414,20 @@ impl App {
         if !view.fullscreen {
             egui::Panel::top("session_bar").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("🖥 {}", view.name)).strong());
+                    let icon = if view.profile == Profile::Game { "🎮" } else { "🖥" };
+                    ui.label(egui::RichText::new(format!("{icon} {}", view.name)).strong());
                     ui.label(view.shared.status.lock().unwrap().clone());
+                    if let Some(g) = &view.game {
+                        let hint = if g.captured {
+                            "мышь захвачена · Ctrl+Alt+Shift+Q — отпустить"
+                        } else {
+                            "кликните по картинке, чтобы захватить мышь"
+                        };
+                        ui.label(egui::RichText::new(hint).weak());
+                    }
+                    if let Some(notice) = view.shared.notice.lock().unwrap().as_deref() {
+                        ui.colored_label(Color32::from_rgb(230, 170, 60), format!("🎮 геймпад: {notice}"));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Отключиться").clicked() {
                             disconnect = true;
@@ -426,7 +463,23 @@ impl App {
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
             }
-            let events = ui.input(|i| i.events.clone());
+            let (events, mods, focused) = ui.input(|i| (i.events.clone(), i.modifiers, i.focused));
+            if let Some(g) = view.game.as_mut() {
+                if !g.captured && resp.clicked() {
+                    g.captured = true;
+                    g.mods = egui::Modifiers::default();
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+                    return;
+                }
+                if g.captured {
+                    let release = !focused || game_input(g, &events, mods, &view.out, &mut view.wheel, &mut view.fullscreen, ui.ctx());
+                    if release {
+                        release_capture(g, &view.out, ui.ctx());
+                    }
+                    return;
+                }
+            }
             for ev in events {
                 if let egui::Event::Key { key: egui::Key::F11, pressed: true, .. } = ev {
                     view.fullscreen ^= true;
@@ -439,10 +492,14 @@ impl App {
             }
         });
 
-        if disconnect {
-            if let Some(d) = self.desktop.take() {
-                d.task.abort();
+        if disconnect && let Some(mut d) = self.desktop.take() {
+            if let Some(g) = d.game.as_mut() {
+                release_capture(g, &d.out, ui.ctx());
             }
+            if d.fullscreen {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+            d.task.abort();
         }
     }
 }
@@ -479,6 +536,192 @@ impl eframe::App for App {
             Tab::Hosts => self.hosts_tab(ui),
             Tab::ThisPc => self.this_pc_tab(ui),
         });
+    }
+}
+
+// ---------- game input ----------
+
+const SC_LCTRL: u16 = 0x1D;
+const SC_LSHIFT: u16 = 0x2A;
+const SC_LALT: u16 = 0x38;
+
+/// Forwards one frame of captured input. Returns true when the user asked to release the pointer.
+fn game_input(
+    g: &mut GameInput,
+    events: &[egui::Event],
+    mods: egui::Modifiers,
+    out: &tmpsc::UnboundedSender<ClientMsg>,
+    wheel: &mut Vec2,
+    fullscreen: &mut bool,
+    ctx: &egui::Context,
+) -> bool {
+    let send = |ev: InputEvent| {
+        let _ = out.send(ClientMsg::Input(ev));
+    };
+    // egui reports modifiers as state, not key events: diff them into scancodes.
+    for (was, now, code) in [(g.mods.ctrl, mods.ctrl, SC_LCTRL), (g.mods.shift, mods.shift, SC_LSHIFT), (g.mods.alt, mods.alt, SC_LALT)] {
+        if was != now {
+            if now {
+                g.pressed.insert((code, false));
+            } else {
+                g.pressed.remove(&(code, false));
+            }
+            send(InputEvent::Scancode { code, extended: false, down: now });
+        }
+    }
+    g.mods = mods;
+
+    for ev in events {
+        match ev {
+            egui::Event::Key { key, physical_key, pressed, modifiers, .. } => {
+                let key = physical_key.unwrap_or(*key);
+                if key == egui::Key::Q && modifiers.ctrl && modifiers.alt && modifiers.shift {
+                    return true;
+                }
+                if key == egui::Key::F11 {
+                    if *pressed {
+                        *fullscreen ^= true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(*fullscreen));
+                    }
+                    continue;
+                }
+                if let Some((code, extended)) = scancode(key) {
+                    if *pressed {
+                        g.pressed.insert((code, extended));
+                    } else {
+                        g.pressed.remove(&(code, extended));
+                    }
+                    send(InputEvent::Scancode { code, extended, down: *pressed });
+                }
+            }
+            // egui turns Ctrl+C/X/V into clipboard events; Ctrl is already down on the host.
+            egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => {
+                let code = match ev {
+                    egui::Event::Copy => 0x2E,
+                    egui::Event::Cut => 0x2D,
+                    _ => 0x2F,
+                };
+                send(InputEvent::Scancode { code, extended: false, down: true });
+                send(InputEvent::Scancode { code, extended: false, down: false });
+            }
+            egui::Event::MouseMoved(delta) => {
+                g.motion += *delta;
+                let (dx, dy) = (g.motion.x.trunc(), g.motion.y.trunc());
+                g.motion -= Vec2::new(dx, dy);
+                if dx != 0.0 || dy != 0.0 {
+                    send(InputEvent::MouseRelative { dx: dx as i32, dy: dy as i32 });
+                }
+            }
+            egui::Event::PointerButton { button, pressed, .. } => {
+                let button = match button {
+                    egui::PointerButton::Primary => MouseButton::Left,
+                    egui::PointerButton::Secondary => MouseButton::Right,
+                    egui::PointerButton::Middle => MouseButton::Middle,
+                    _ => continue,
+                };
+                send(InputEvent::MouseButton { button, down: *pressed });
+            }
+            egui::Event::MouseWheel { .. } => {
+                for msg in translate(ev, Rect::EVERYTHING, &mut None, wheel) {
+                    send(msg);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn release_capture(g: &mut GameInput, out: &tmpsc::UnboundedSender<ClientMsg>, ctx: &egui::Context) {
+    for (code, extended) in g.pressed.drain() {
+        let _ = out.send(ClientMsg::Input(InputEvent::Scancode { code, extended, down: false }));
+    }
+    g.captured = false;
+    g.mods = egui::Modifiers::default();
+    ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
+    ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+}
+
+/// PC/AT set-1 scancode for a physical key (and whether it needs the E0 "extended" prefix).
+fn scancode(key: egui::Key) -> Option<(u16, bool)> {
+    use egui::Key as K;
+    let plain = |c: u16| Some((c, false));
+    let ext = |c: u16| Some((c, true));
+    match key {
+        K::Escape => plain(0x01),
+        K::Num1 => plain(0x02),
+        K::Num2 => plain(0x03),
+        K::Num3 => plain(0x04),
+        K::Num4 => plain(0x05),
+        K::Num5 => plain(0x06),
+        K::Num6 => plain(0x07),
+        K::Num7 => plain(0x08),
+        K::Num8 => plain(0x09),
+        K::Num9 => plain(0x0A),
+        K::Num0 => plain(0x0B),
+        K::Minus => plain(0x0C),
+        K::Equals | K::Plus => plain(0x0D),
+        K::Backspace => plain(0x0E),
+        K::Tab => plain(0x0F),
+        K::Q => plain(0x10),
+        K::W => plain(0x11),
+        K::E => plain(0x12),
+        K::R => plain(0x13),
+        K::T => plain(0x14),
+        K::Y => plain(0x15),
+        K::U => plain(0x16),
+        K::I => plain(0x17),
+        K::O => plain(0x18),
+        K::P => plain(0x19),
+        K::OpenBracket => plain(0x1A),
+        K::CloseBracket => plain(0x1B),
+        K::Enter => plain(0x1C),
+        K::A => plain(0x1E),
+        K::S => plain(0x1F),
+        K::D => plain(0x20),
+        K::F => plain(0x21),
+        K::G => plain(0x22),
+        K::H => plain(0x23),
+        K::J => plain(0x24),
+        K::K => plain(0x25),
+        K::L => plain(0x26),
+        K::Semicolon => plain(0x27),
+        K::Quote => plain(0x28),
+        K::Backtick => plain(0x29),
+        K::Backslash => plain(0x2B),
+        K::Z => plain(0x2C),
+        K::X => plain(0x2D),
+        K::C => plain(0x2E),
+        K::V => plain(0x2F),
+        K::B => plain(0x30),
+        K::N => plain(0x31),
+        K::M => plain(0x32),
+        K::Comma => plain(0x33),
+        K::Period => plain(0x34),
+        K::Slash => plain(0x35),
+        K::Space => plain(0x39),
+        K::F1 => plain(0x3B),
+        K::F2 => plain(0x3C),
+        K::F3 => plain(0x3D),
+        K::F4 => plain(0x3E),
+        K::F5 => plain(0x3F),
+        K::F6 => plain(0x40),
+        K::F7 => plain(0x41),
+        K::F8 => plain(0x42),
+        K::F9 => plain(0x43),
+        K::F10 => plain(0x44),
+        K::F12 => plain(0x58),
+        K::Home => ext(0x47),
+        K::ArrowUp => ext(0x48),
+        K::PageUp => ext(0x49),
+        K::ArrowLeft => ext(0x4B),
+        K::ArrowRight => ext(0x4D),
+        K::End => ext(0x4F),
+        K::ArrowDown => ext(0x50),
+        K::PageDown => ext(0x51),
+        K::Insert => ext(0x52),
+        K::Delete => ext(0x53),
+        _ => None,
     }
 }
 

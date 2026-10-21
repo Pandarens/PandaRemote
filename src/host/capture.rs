@@ -21,12 +21,11 @@ const MAX_WIDTH: u32 = 2560;
 /// Reed-Solomon parity added to every frame.
 const PARITY_PERCENT: u32 = 20;
 
-/// Streamed frame size; also the primary monitor's coordinate space divided by `scale`.
+/// Streamed frame size (the primary monitor, possibly downscaled).
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub width: u32,
     pub height: u32,
-    pub scale: u32,
 }
 
 pub struct StreamStart {
@@ -118,7 +117,7 @@ fn capture_loop(
     let scale = sw.div_ceil(MAX_WIDTH).max(1);
     // H.264 needs even dimensions.
     let (w, h) = ((sw / scale) & !1, (sh / scale) & !1);
-    let geometry = Geometry { width: w, height: h, scale };
+    let geometry = Geometry { width: w, height: h };
 
     let fps = profile.fps();
     let mut bitrate = control.bitrate.load(Ordering::Relaxed);

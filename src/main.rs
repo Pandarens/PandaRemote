@@ -57,6 +57,9 @@ enum Command {
         seconds: u64,
         #[arg(long)]
         game: bool,
+        /// Через 2 с сдвинуть мышь хоста относительным движением и вернуть обратно (проверка ввода)
+        #[arg(long, hide = true)]
+        nudge: bool,
     },
 }
 
@@ -102,7 +105,7 @@ fn main() -> Result<()> {
             Ok(())
         }),
         Some(Command::BenchEncoder { sw, fps }) => bench_encoder(!sw, fps),
-        Some(Command::Probe { ticket, out, seconds, game }) => rt.block_on(async {
+        Some(Command::Probe { ticket, out, seconds, game, nudge }) => rt.block_on(async {
             let ticket = ticket::Ticket::decode(&ticket)?;
             let started = std::time::Instant::now();
             let session = client::connect(&ticket, profile(game)).await?;
@@ -114,6 +117,16 @@ fn main() -> Result<()> {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             });
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            if nudge {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    for (dx, dy) in [(200, 100), (-200, -100)] {
+                        let _ = tx.send(proto::ClientMsg::Input(proto::InputEvent::MouseRelative { dx, dy }));
+                        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    }
+                });
+            }
             let run = client::viewer::run(session, shared.clone(), tx, rx, repaint);
             let _ = tokio::time::timeout(std::time::Duration::from_secs(seconds), run).await;
             let frame = shared.frame.lock().unwrap().take();
