@@ -52,6 +52,17 @@ pub fn install() -> Result<()> {
     )
     .context("нужны права администратора: запустите терминал от имени администратора")?;
 
+    // Installing over an existing service is an upgrade: stop it first so its program file is free.
+    let existing = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::CHANGE_CONFIG,
+        )
+        .ok();
+    if let Some(service) = &existing {
+        stop_and_wait(service)?;
+    }
+
     // The service runs as SYSTEM with whatever key and secret it finds here, so the directory must not be
     // writable (or pre-seeded) by ordinary users: take ownership, drop inherited rights, and allow only
     // SYSTEM and Administrators. Then always copy this user's files over (existing tickets keep working).
@@ -85,13 +96,36 @@ pub fn install() -> Result<()> {
         account_name: None, // LocalSystem
         account_password: None,
     };
-    let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-        .context("не удалось создать службу (уже установлена?)")?;
+    let service = match existing {
+        Some(service) => {
+            service.change_config(&info).context("не удалось обновить службу")?;
+            service
+        }
+        None => manager
+            .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+            .context("не удалось создать службу")?,
+    };
     let _ = service.set_description("Удалённый доступ Panda Remote: экран блокировки, UAC, работа до входа в систему");
     config::set_service_installed(true)?;
     service.start::<&str>(&[]).context("служба создана, но не запустилась")?;
     Ok(())
+}
+
+/// Stops the service and waits (up to 10 s) until it reports Stopped, so its program file is released.
+fn stop_and_wait(service: &windows_service::service::Service) -> Result<()> {
+    if service.query_status()?.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    let _ = service.stop();
+    for _ in 0..100 {
+        if service.query_status()?.current_state == ServiceState::Stopped {
+            // The process may still be exiting for a moment after reporting Stopped.
+            std::thread::sleep(Duration::from_millis(500));
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("служба не остановилась за 10 секунд")
 }
 
 /// Owner = Administrators, no inheritance, full control for SYSTEM and Administrators only (by SID, so it
@@ -134,15 +168,7 @@ pub fn uninstall() -> Result<()> {
     let service = manager
         .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS)
         .context("служба не установлена")?;
-    if service.query_status()?.current_state != ServiceState::Stopped {
-        let _ = service.stop();
-        for _ in 0..50 {
-            if service.query_status()?.current_state == ServiceState::Stopped {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
+    stop_and_wait(&service)?;
     service.delete()?;
     config::set_service_installed(false)?;
     // The installed copy is no longer in use (best effort: it may still be shutting down).

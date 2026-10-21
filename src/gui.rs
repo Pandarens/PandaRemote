@@ -219,9 +219,11 @@ impl App {
                 UiEvent::ServiceDone(installing, result) => {
                     self.this_pc.service_busy = false;
                     self.message = Some(match (installing, result) {
-                        (true, Ok(())) => {
-                            (false, "Служба установлена: ПК доступен на экране блокировки и до входа в систему.".into())
-                        }
+                        (true, Ok(())) => (
+                            false,
+                            "Служба установлена и запущена: ПК доступен на экране блокировки и до входа в систему."
+                                .into(),
+                        ),
                         (false, Ok(())) => (false, "Служба удалена.".into()),
                         (_, Err(e)) => (true, format!("Служба: {e}")),
                     });
@@ -439,9 +441,20 @@ impl App {
             }
         }
         ui.add_space(6.0);
-        if ui.add_enabled(!self.this_pc.service_busy, egui::Button::new("Удалить службу…")).clicked() {
-            self.service_action(false);
-        }
+        ui.horizontal(|ui| {
+            let busy = self.this_pc.service_busy;
+            // Reinstalling over the running service upgrades it to this version of the program.
+            if ui
+                .add_enabled(!busy, egui::Button::new("Обновить службу…"))
+                .on_hover_text("Перезапустить службу с этой версией программы")
+                .clicked()
+            {
+                self.service_action(true);
+            }
+            if ui.add_enabled(!busy, egui::Button::new("Удалить службу…")).clicked() {
+                self.service_action(false);
+            }
+        });
         ui.ctx().request_repaint_after(Duration::from_secs(2));
     }
 
