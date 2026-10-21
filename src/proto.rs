@@ -59,13 +59,22 @@ pub enum ClientMsg {
     Gamepad(GamepadState),
     RequestKeyframe,
     /// Sent once a second: frames assembled and frames lost since the previous report.
-    Stats { frames: u32, lost: u32 },
+    Stats {
+        frames: u32,
+        lost: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum HostMsg {
-    Challenge { nonce: [u8; 32], host_name: String },
-    AuthResult { ok: bool, reason: String },
+    Challenge {
+        nonce: [u8; 32],
+        host_name: String,
+    },
+    AuthResult {
+        ok: bool,
+        reason: String,
+    },
     StreamInfo {
         width: u32,
         height: u32,
@@ -76,21 +85,44 @@ pub enum HostMsg {
         gamepad_error: Option<String>,
     },
     /// Force feedback the game set on the virtual controller (0 = off).
-    Rumble { large: u8, small: u8 },
+    Rumble {
+        large: u8,
+        small: u8,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum InputEvent {
     /// Position normalized to 0..=65535 over the streamed frame.
-    MouseMove { x: u16, y: u16 },
+    MouseMove {
+        x: u16,
+        y: u16,
+    },
     /// Raw relative motion (game profile, pointer captured).
-    MouseRelative { dx: i32, dy: i32 },
-    MouseButton { button: MouseButton, down: bool },
+    MouseRelative {
+        dx: i32,
+        dy: i32,
+    },
+    MouseButton {
+        button: MouseButton,
+        down: bool,
+    },
     /// Wheel notches; positive `dy` scrolls down, positive `dx` scrolls right.
-    Wheel { dx: i32, dy: i32 },
-    Key { key: KeyCode, down: bool, mods: Modifiers },
+    Wheel {
+        dx: i32,
+        dy: i32,
+    },
+    Key {
+        key: KeyCode,
+        down: bool,
+        mods: Modifiers,
+    },
     /// Physical key by PC/AT set-1 scancode (game profile).
-    Scancode { code: u16, extended: bool, down: bool },
+    Scancode {
+        code: u16,
+        extended: bool,
+        down: bool,
+    },
     Text(String),
 }
 
@@ -168,11 +200,7 @@ pub async fn bind_endpoint(key: SecretKey) -> Result<Endpoint> {
         .datagram_receive_buffer_size(Some(8 * 1024 * 1024))
         .datagram_send_buffer_size(8 * 1024 * 1024)
         .build();
-    Ok(Endpoint::builder(presets::N0)
-        .secret_key(key)
-        .transport_config(transport)
-        .bind()
-        .await?)
+    Ok(Endpoint::builder(presets::N0).secret_key(key).transport_config(transport).bind().await?)
 }
 
 pub async fn write_msg<T: Serialize>(send: &mut SendStream, msg: &T) -> Result<()> {

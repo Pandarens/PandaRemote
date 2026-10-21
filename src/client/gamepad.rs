@@ -73,8 +73,16 @@ fn set_rumble(gilrs: &mut Gilrs, old: Option<Effect>, large: u8, small: u8) -> O
     // A 1 s slot repeated forever (the builder's default) = constant vibration until the next change.
     let scheduling = Replay { after: Ticks::from_ms(0), play_for: Ticks::from_ms(1000), with_delay: Ticks::from_ms(0) };
     let effect = EffectBuilder::new()
-        .add_effect(BaseEffect { kind: BaseEffectType::Strong { magnitude: large as u16 * 257 }, scheduling, envelope: Default::default() })
-        .add_effect(BaseEffect { kind: BaseEffectType::Weak { magnitude: small as u16 * 257 }, scheduling, envelope: Default::default() })
+        .add_effect(BaseEffect {
+            kind: BaseEffectType::Strong { magnitude: large as u16 * 257 },
+            scheduling,
+            envelope: Default::default(),
+        })
+        .add_effect(BaseEffect {
+            kind: BaseEffectType::Weak { magnitude: small as u16 * 257 },
+            scheduling,
+            envelope: Default::default(),
+        })
         .gamepads(&pads)
         .finish(gilrs)
         .map_err(|e| tracing::debug!("rumble effect: {e}"))

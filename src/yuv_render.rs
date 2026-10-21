@@ -156,8 +156,12 @@ impl CallbackTrait for Nv12Callback {
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let Some(frame) = self.pending.lock().unwrap().take() else { return Vec::new() };
-        let Some(res) = resources.get_mut::<Resources>() else { return Vec::new() };
+        let Some(frame) = self.pending.lock().unwrap().take() else {
+            return Vec::new();
+        };
+        let Some(res) = resources.get_mut::<Resources>() else {
+            return Vec::new();
+        };
         let size = (frame.width as u32, frame.height as u32);
         if res.textures.as_ref().is_none_or(|t| t.size != size) {
             res.textures = Some(create_textures(device, res, size));
@@ -166,8 +170,15 @@ impl CallbackTrait for Nv12Callback {
         Vec::new()
     }
 
-    fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, resources: &CallbackResources) {
-        let Some(res) = resources.get::<Resources>() else { return };
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        pass: &mut wgpu::RenderPass<'static>,
+        resources: &CallbackResources,
+    ) {
+        let Some(res) = resources.get::<Resources>() else {
+            return;
+        };
         let Some(t) = &res.textures else { return };
         pass.set_pipeline(&res.pipeline);
         pass.set_bind_group(0, &t.bind_group, &[]);
@@ -179,7 +190,12 @@ fn upload(queue: &wgpu::Queue, t: &Textures, frame: &VideoFrame) {
     let (w, h) = t.size;
     let write = |texture: &wgpu::Texture, data: &[u8], bytes_per_row: u32, w: u32, h: u32| {
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             data,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(h) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -208,8 +224,14 @@ fn create_textures(device: &wgpu::Device, res: &Resources, (w, h): (u32, u32)) -
         label: Some("nv12"),
         layout: &res.layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y.create_view(&Default::default())) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv.create_view(&Default::default())) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&y.create_view(&Default::default())),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&uv.create_view(&Default::default())),
+            },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&res.sampler) },
         ],
     });
@@ -268,7 +290,10 @@ mod tests {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 ..Default::default()
             });
@@ -277,10 +302,19 @@ mod tests {
             pass.draw(0..3, 0..1);
         }
         encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: &target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size * 4),
+                    rows_per_image: Some(size),
+                },
             },
             wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
         );

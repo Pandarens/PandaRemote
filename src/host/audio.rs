@@ -44,7 +44,9 @@ fn run(conn: &Connection, stop: &AtomicBool, ready: &mpsc::Sender<Result<()>>) -
     let err = |e| tracing::debug!("loopback stream error: {e}");
     // An input stream on an output device is WASAPI loopback.
     let stream = match supported.sample_format() {
-        SampleFormat::F32 => device.build_input_stream::<f32, _, _>(config, move |d, _| drop(tx.try_send(d.to_vec())), err, None)?,
+        SampleFormat::F32 => {
+            device.build_input_stream::<f32, _, _>(config, move |d, _| drop(tx.try_send(d.to_vec())), err, None)?
+        }
         SampleFormat::I16 => device.build_input_stream::<i16, _, _>(
             config,
             move |d, _| drop(tx.try_send(d.iter().map(|&s| s as f32 / 32768.0).collect())),
@@ -64,7 +66,9 @@ fn run(conn: &Connection, stop: &AtomicBool, ready: &mpsc::Sender<Result<()>>) -
     let (mut stereo, mut pending, mut out) = (Vec::new(), Vec::new(), vec![0u8; 1500]);
     let mut seq: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
-        let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) else { continue };
+        let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
         stereo.clear();
         audio::to_stereo(&chunk, channels, &mut stereo);
         resampler.process(&stereo, &mut pending);

@@ -64,7 +64,9 @@ pub async fn run(
     play_audio: bool,
 ) -> Result<()> {
     let Session { conn, mut send, mut recv, .. } = session;
-    let HostMsg::StreamInfo { width, height, fps, encoder, audio: has_audio, gamepad_error } = proto::read_msg(&mut recv).await? else {
+    let HostMsg::StreamInfo { width, height, fps, encoder, audio: has_audio, gamepad_error } =
+        proto::read_msg(&mut recv).await?
+    else {
         anyhow::bail!("expected StreamInfo");
     };
     *shared.notice.lock().unwrap() = gamepad_error;
@@ -140,8 +142,7 @@ pub async fn run(
             let audio = if shared.audio_packets.swap(0, Ordering::Relaxed) > 0 { " · 🔊" } else { "" };
             let _ = out_tx.send(ClientMsg::Stats { frames, lost });
             let loss = if frames + lost > 0 { lost * 100 / (frames + lost) } else { 0 };
-            *shared.status.lock().unwrap() =
-                format!(
+            *shared.status.lock().unwrap() = format!(
                 "{} · {decoded} к/с · потери {loss}%{audio} · кодер: {encoder} · декодер: {}",
                 super::path_summary(&conn),
                 shared.decoder.lock().unwrap()

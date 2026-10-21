@@ -26,11 +26,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 static ENDPOINT: OnceCell<Endpoint> = OnceCell::const_new();
 
 async fn endpoint() -> Result<&'static Endpoint> {
-    ENDPOINT
-        .get_or_try_init(|| async {
-            proto::bind_endpoint(config::client_key()?).await
-        })
-        .await
+    ENDPOINT.get_or_try_init(|| async { proto::bind_endpoint(config::client_key()?).await }).await
 }
 
 pub struct Session {
@@ -48,11 +44,7 @@ pub async fn connect(ticket: &Ticket, profile: Profile) -> Result<Session> {
         .context("не удалось соединиться с хостом")?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
-    let hello = ClientMsg::Hello {
-        version: PROTOCOL_VERSION,
-        client_name: config::machine_name(),
-        profile,
-    };
+    let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, client_name: config::machine_name(), profile };
     proto::write_msg(&mut send, &hello).await?;
     let HostMsg::Challenge { nonce, host_name } = proto::read_msg(&mut recv).await? else {
         bail!("unexpected message from host");

@@ -33,10 +33,7 @@ impl Ticket {
             bail!("ticket has wrong length");
         }
         let host_id = EndpointId::from_bytes(raw[..32].try_into()?)?;
-        Ok(Ticket {
-            host_id,
-            secret: raw[32..].try_into()?,
-        })
+        Ok(Ticket { host_id, secret: raw[32..].try_into()? })
     }
 }
 
@@ -46,10 +43,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let t = Ticket {
-            host_id: iroh::SecretKey::generate().public(),
-            secret: [7; 32],
-        };
+        let t = Ticket { host_id: iroh::SecretKey::generate().public(), secret: [7; 32] };
         let back = Ticket::decode(&t.encode()).unwrap();
         assert_eq!(back.host_id, t.host_id);
         assert_eq!(back.secret, t.secret);

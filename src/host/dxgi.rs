@@ -48,7 +48,12 @@ impl Dxgi {
                     if !desc.AttachedToDesktop.as_bool() || r.left != 0 || r.top != 0 {
                         continue;
                     }
-                    return Self::open(&adapter, output.cast::<IDXGIOutput1>()?, (r.right - r.left) as u32, (r.bottom - r.top) as u32);
+                    return Self::open(
+                        &adapter,
+                        output.cast::<IDXGIOutput1>()?,
+                        (r.right - r.left) as u32,
+                        (r.bottom - r.top) as u32,
+                    );
                 }
             }
         }

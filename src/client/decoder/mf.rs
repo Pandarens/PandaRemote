@@ -12,9 +12,9 @@ use windows::{
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
-                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ,
-                D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
-                ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
             },
         },
         Media::MediaFoundation::*,
@@ -89,15 +89,7 @@ impl MfDecoder {
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             transform.SetInputType(0, &input, 0).context("SetInputType")?;
         }
-        let mut decoder = MfDecoder {
-            transform,
-            gpu,
-            width,
-            height,
-            alloc_height: height,
-            timestamp: 0,
-            name,
-        };
+        let mut decoder = MfDecoder { transform, gpu, width, height, alloc_height: height, timestamp: 0, name };
         decoder.set_nv12_output()?;
         unsafe {
             decoder.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
@@ -110,7 +102,9 @@ impl MfDecoder {
     /// Picks NV12 among the output types (again after a stream change) and records the surface size.
     fn set_nv12_output(&mut self) -> Result<()> {
         for i in 0.. {
-            let Ok(ty) = (unsafe { self.transform.GetOutputAvailableType(0, i) }) else { break };
+            let Ok(ty) = (unsafe { self.transform.GetOutputAvailableType(0, i) }) else {
+                break;
+            };
             let subtype: GUID = unsafe { ty.GetGUID(&MF_MT_SUBTYPE) }?;
             if subtype != MFVideoFormat_NV12 {
                 continue;
@@ -149,7 +143,9 @@ impl MfDecoder {
             let sample = unsafe { ManuallyDrop::take(&mut buffers[0].pSample) };
             drop(unsafe { ManuallyDrop::take(&mut buffers[0].pEvents) });
             match result {
-                Ok(()) => return self.read_picture(&sample.context("decoder returned no sample")?).map(Some),
+                Ok(()) => {
+                    return self.read_picture(&sample.context("decoder returned no sample")?).map(Some);
+                }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
                 // First SPS parsed (or resolution changed): renegotiate and try again.
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => self.set_nv12_output()?,
@@ -319,7 +315,9 @@ fn activate_decoder() -> Result<(IMFTransform, String)> {
         let activates = std::slice::from_raw_parts_mut(list, count as usize);
         let mut result = Err(anyhow::anyhow!("no H.264 decoder could be activated"));
         for slot in activates.iter_mut() {
-            let Some(activate) = slot.take() else { continue };
+            let Some(activate) = slot.take() else {
+                continue;
+            };
             if result.is_ok() {
                 continue;
             }

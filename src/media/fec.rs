@@ -18,7 +18,13 @@ const FLAG_KEYFRAME: u8 = 1;
 const STALE: Duration = Duration::from_secs(1);
 
 /// Splits an encoded frame into datagrams no larger than `max_datagram`, adding `parity_percent` parity.
-pub fn packetize(frame_id: u32, data: &[u8], keyframe: bool, max_datagram: usize, parity_percent: u32) -> Result<Vec<Bytes>> {
+pub fn packetize(
+    frame_id: u32,
+    data: &[u8],
+    keyframe: bool,
+    max_datagram: usize,
+    parity_percent: u32,
+) -> Result<Vec<Bytes>> {
     // Reed-Solomon shards must have an even, equal size.
     let shard = (max_datagram.saturating_sub(HEADER)) & !1;
     if shard < 64 {

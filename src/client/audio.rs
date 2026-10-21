@@ -61,11 +61,15 @@ fn run(rx: mpsc::Receiver<Bytes>) -> Result<()> {
                     (0.0, 0.0)
                 };
                 for c in 0..out_channels {
-                    write(f, c, match c {
-                        0 => l,
-                        1 => r,
-                        _ => (l + r) * 0.5,
-                    });
+                    write(
+                        f,
+                        c,
+                        match c {
+                            0 => l,
+                            1 => r,
+                            _ => (l + r) * 0.5,
+                        },
+                    );
                 }
             }
         }
@@ -73,35 +77,36 @@ fn run(rx: mpsc::Receiver<Bytes>) -> Result<()> {
     let err = |e| tracing::debug!("audio output error: {e}");
     let config = supported.config();
     let stream = match supported.sample_format() {
-        SampleFormat::F32 => {
-            device.build_output_stream::<f32, _, _>(
-                config,
-                move |data, _| fill(data.len() / out_channels, &mut |f, c, s| data[f * out_channels + c] = s),
-                err,
-                None,
-            )?
-        }
-        SampleFormat::I16 => {
-            device.build_output_stream::<i16, _, _>(
-                config,
-                move |data, _| {
-                    fill(data.len() / out_channels, &mut |f, c, s| data[f * out_channels + c] = (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-                },
-                err,
-                None,
-            )?
-        }
+        SampleFormat::F32 => device.build_output_stream::<f32, _, _>(
+            config,
+            move |data, _| fill(data.len() / out_channels, &mut |f, c, s| data[f * out_channels + c] = s),
+            err,
+            None,
+        )?,
+        SampleFormat::I16 => device.build_output_stream::<i16, _, _>(
+            config,
+            move |data, _| {
+                fill(data.len() / out_channels, &mut |f, c, s| {
+                    data[f * out_channels + c] = (s.clamp(-1.0, 1.0) * 32767.0) as i16
+                })
+            },
+            err,
+            None,
+        )?,
         other => bail!("unsupported sample format {other:?}"),
     };
     stream.play()?;
 
-    let mut decoder = OpusDecoder::new(SAMPLE_RATE as i32, CHANNELS).map_err(|e| anyhow::anyhow!("opus decoder: {e}"))?;
+    let mut decoder =
+        OpusDecoder::new(SAMPLE_RATE as i32, CHANNELS).map_err(|e| anyhow::anyhow!("opus decoder: {e}"))?;
     let mut resampler = Resampler::new(SAMPLE_RATE, rate);
     let mut pcm = vec![0f32; FRAME_SAMPLES * CHANNELS];
     let mut resampled = Vec::new();
     let mut last_seq: Option<u32> = None;
     for dgram in rx {
-        let Some((seq, opus)) = audio::parse(&dgram) else { continue };
+        let Some((seq, opus)) = audio::parse(&dgram) else {
+            continue;
+        };
         if last_seq.is_some_and(|l| seq.wrapping_sub(l) > u32::MAX / 2 || seq == l) {
             continue; // late or duplicate
         }

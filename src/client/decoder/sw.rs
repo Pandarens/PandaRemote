@@ -22,7 +22,9 @@ impl VideoDecoder for SwDecoder {
     }
 
     fn decode(&mut self, au: &[u8]) -> Result<Option<VideoFrame>> {
-        let Some(yuv) = self.decoder.decode(au)? else { return Ok(None) };
+        let Some(yuv) = self.decoder.decode(au)? else {
+            return Ok(None);
+        };
         let (width, height) = yuv.dimensions();
         let (ys, us, vs) = yuv.strides();
         let mut y = Vec::with_capacity(width * height);

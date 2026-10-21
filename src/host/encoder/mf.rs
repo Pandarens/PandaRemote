@@ -97,7 +97,10 @@ impl MfEncoder {
         if let Some(c) = &codec {
             unsafe {
                 let _ = c.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true));
-                let _ = c.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32));
+                let _ = c.SetValue(
+                    &CODECAPI_AVEncCommonRateControlMode,
+                    &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
+                );
                 let _ = c.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate));
                 // Long GOP: keyframes are requested explicitly after losses.
                 let _ = c.SetValue(&CODECAPI_AVEncMPVGOPSize, &variant_u32(fps * 10));
@@ -281,7 +284,9 @@ fn activate_hardware_encoder() -> Result<(IMFTransform, String)> {
         let activates = std::slice::from_raw_parts_mut(list, count as usize);
         let mut result = Err(anyhow::anyhow!("no hardware H.264 encoder could be activated"));
         for slot in activates.iter_mut() {
-            let Some(activate) = slot.take() else { continue };
+            let Some(activate) = slot.take() else {
+                continue;
+            };
             if result.is_ok() {
                 continue;
             }
@@ -319,7 +324,9 @@ fn stream_ids(t: &IMFTransform) -> (u32, u32) {
 
 fn find_nv12_input(t: &IMFTransform, input_id: u32) -> Result<IMFMediaType> {
     for i in 0.. {
-        let Ok(ty) = (unsafe { t.GetInputAvailableType(input_id, i) }) else { break };
+        let Ok(ty) = (unsafe { t.GetInputAvailableType(input_id, i) }) else {
+            break;
+        };
         let subtype: GUID = unsafe { ty.GetGUID(&MF_MT_SUBTYPE) }?;
         if subtype == MFVideoFormat_NV12 {
             return Ok(ty);
