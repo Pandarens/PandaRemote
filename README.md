@@ -40,7 +40,8 @@ cargo build --release
 **Чтобы ПК был доступен всегда** (экран блокировки, окна UAC, после перезагрузки до входа в систему), установите службу: `panda-rc.exe` → «Этот компьютер» → **«Установить службу…»** и подтвердите запрос Windows. Или в терминале администратора, указав полный путь:
 
 ```
-.	argetelease\panda-rc.exe service install
+.	arget
+.\target\release\panda-rc.exe service install
 ```
 
 Билет остаётся прежним. Удалить — кнопкой «Удалить службу…» или `panda-rc service uninstall`.
