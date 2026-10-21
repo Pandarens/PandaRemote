@@ -1,0 +1,50 @@
+[package]
+name = "panda-android"
+version = "0.4.0"
+edition = "2024"
+description = "Panda Remote viewer for Android"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+panda-rc = { path = ".." }
+anyhow = "1.0.104"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "android-native-activity"] }
+iroh = "1.4"
+jni = "0.21"
+log = "0.4"
+android_logger = "0.15"
+tokio = { version = "1.54.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[package.metadata.android]
+package = "com.pandarens.panda"
+apk_name = "panda-remote"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 35
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+
+[package.metadata.android.application]
+label = "Panda Remote"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+
+[package.metadata.android.application.activity]
+config_changes = "orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode"
+orientation = "sensor"
+launch_mode = "singleTask"
