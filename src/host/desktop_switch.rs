@@ -29,6 +29,37 @@ pub fn input_desktop_name() -> Option<String> {
     }
 }
 
+/// True while this process's Windows session is locked. On Windows 11 the lock screen is drawn on the
+/// normal `Default` desktop, so the desktop name alone doesn't reveal it.
+pub fn session_locked() -> bool {
+    use windows::Win32::System::{
+        RemoteDesktop::{
+            ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW,
+            WTSSessionInfoEx,
+        },
+        Threading::GetCurrentProcessId,
+    };
+    const WTS_SESSIONSTATE_LOCK: i32 = 0;
+    unsafe {
+        let mut session = 0u32;
+        if ProcessIdToSessionId(GetCurrentProcessId(), &mut session).is_err() {
+            return false;
+        }
+        let mut buf = windows::core::PWSTR::null();
+        let mut len = 0u32;
+        if WTSQuerySessionInformationW(Some(WTS_CURRENT_SERVER_HANDLE), session, WTSSessionInfoEx, &mut buf, &mut len)
+            .is_err()
+            || buf.is_null()
+        {
+            return false;
+        }
+        let info = &*(buf.0 as *const WTSINFOEXW);
+        let locked = info.Level == 1 && info.Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK;
+        WTSFreeMemory(buf.0.cast());
+        locked
+    }
+}
+
 /// Name of the desktop the calling thread is attached to.
 pub fn thread_desktop_name() -> Option<String> {
     unsafe { GetThreadDesktop(GetCurrentThreadId()).ok().and_then(desktop_name) }

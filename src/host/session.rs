@@ -126,7 +126,8 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
 
 fn on_secure_desktop() -> bool {
     #[cfg(windows)]
-    return super::desktop_switch::input_desktop_name().is_some_and(|n| !n.eq_ignore_ascii_case("Default"));
+    return super::desktop_switch::session_locked()
+        || super::desktop_switch::input_desktop_name().is_some_and(|n| !n.eq_ignore_ascii_case("Default"));
     #[cfg(not(windows))]
     false
 }
