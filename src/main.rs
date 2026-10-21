@@ -96,7 +96,8 @@ enum Command {
         /// Через 2 с сдвинуть мышь хоста относительным движением и вернуть обратно (проверка ввода)
         #[arg(long, hide = true)]
         nudge: bool,
-        /// Через 2 с выполнить действия через запятую: `click` (клик в центре) или сканкод в hex (нажать и отпустить)
+        /// Через 2 с выполнить действия через запятую: `click` (клик в центре), сканкод в hex (нажать и отпустить),
+        /// `draw` (линия поверх экрана) или `sas` (Ctrl+Alt+Del через службу)
         #[arg(long, hide = true)]
         actions: Option<String>,
     },
@@ -353,8 +354,9 @@ fn main() -> Result<()> {
                     use proto::{ClientMsg::Input, InputEvent::*, MouseButton};
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     // Test input only ever goes to the lock screen, never into someone's open windows.
-                    // Drawing is not input (it only shows an overlay), so it is always allowed.
-                    let draw_only = actions.split(',').all(|a| a.trim() == "draw");
+                    // Drawing is not input (it only shows an overlay), and Ctrl+Alt+Del only opens the security
+                    // screen, so those are always allowed.
+                    let draw_only = actions.split(',').all(|a| matches!(a.trim(), "draw" | "sas"));
                     if !draw_only && !shared.secure_desktop.load(std::sync::atomic::Ordering::Relaxed) {
                         println!("Действия пропущены: хост не на экране блокировки");
                         return;
@@ -371,6 +373,8 @@ fn main() -> Result<()> {
                                     color: media::annotate::COLORS[0],
                                 }));
                             }
+                        } else if action == "sas" {
+                            let _ = tx.send(proto::ClientMsg::SecureAttention);
                         } else if action == "click" {
                             let _ = tx.send(Input(MouseMove { x: 32768, y: 32768 }));
                             let _ = tx

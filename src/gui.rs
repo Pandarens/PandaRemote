@@ -1006,11 +1006,26 @@ impl App {
                         .clicked()
                     {
                         self.update_now.notify_one();
+                        // The service updates itself; have it look now too.
+                        #[cfg(windows)]
+                        if service_mode && let Err(e) = crate::service::request_update_check() {
+                            self.message = Some((true, format!("Служба: не удалось запросить проверку: {e:#}")));
+                        }
                     }
                 });
             });
         });
 
+        #[cfg(windows)]
+        if service_mode && let Some(s) = crate::service::update_status() {
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                icon(ui, Icon::Shield, MUTED, 14.0);
+                ui.label(muted(format!("Служба {} · обновляется сама · {}", s.version, s.state)).small())
+                    .on_hover_text(format!("Последнее событие: {}", s.at.replace('T', " ").trim_end_matches('Z')));
+            });
+            ui.add_space(2.0);
+        }
         let chevron = if self.this_pc.journal_open { Icon::ChevronDown } else { Icon::Chevron };
         if button(ui, Some(chevron), "Журнал подключений", Kind::Ghost).clicked() {
             self.this_pc.journal_open ^= true;

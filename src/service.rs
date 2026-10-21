@@ -384,17 +384,34 @@ pub fn restart() -> Result<()> {
 
 /// Checks GitHub for a signed release every 6 hours (first time shortly after start). When one is
 /// found it replaces the installed program and restarts the service from a separate process.
+/// Wakes the updater early ("check now" from the app, through [`CHECK_EVENT`]).
+static CHECK_NOW: std::sync::OnceLock<mpsc::Sender<()>> = std::sync::OnceLock::new();
+
+/// Checks GitHub releases 30 s after start, every 6 hours and when asked, installs a newer signed release
+/// and restarts into it. Each outcome goes to `service-update.json` next to the logs, for the app to show.
 fn spawn_updater() {
-    let _ = std::thread::Builder::new().name("updater".into()).spawn(|| {
+    let (tx, rx) = mpsc::channel();
+    let _ = CHECK_NOW.set(tx);
+    let _ = std::thread::Builder::new().name("updater".into()).spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
-        std::thread::sleep(Duration::from_secs(120));
+        write_update_state("проверка через 30 с");
+        let _ = rx.recv_timeout(Duration::from_secs(30));
         loop {
+            write_update_state("проверка…");
             match rt.block_on(update_once()) {
                 Ok(true) => return, // restarting into the new version
-                Ok(false) => {}
-                Err(e) => tracing::warn!("update check failed: {e:#}"),
+                Ok(false) => {
+                    tracing::info!("update check: up to date");
+                    write_update_state("последняя версия");
+                }
+                Err(e) => {
+                    tracing::warn!("update check failed: {e:#}");
+                    write_update_state(&format!("не удалось проверить: {e:#}"));
+                }
             }
-            std::thread::sleep(crate::update::CHECK_INTERVAL);
+            // Drain pokes that came in during the check, then wait for the next one or the interval.
+            while rx.try_recv().is_ok() {}
+            let _ = rx.recv_timeout(crate::update::CHECK_INTERVAL);
         }
     });
 }
@@ -402,12 +419,53 @@ fn spawn_updater() {
 async fn update_once() -> Result<bool> {
     let Some(rel) = crate::update::newer_release().await? else { return Ok(false) };
     tracing::info!(version = %rel.version, "new release, downloading");
+    write_update_state(&format!("загрузка {}", rel.version));
     let staged = crate::update::download(&rel, &crate::update::staging_dir(true)).await?;
     let exe = std::env::current_exe()?;
     crate::update::install(&staged, &exe)?;
     tracing::info!(version = %rel.version, "update installed, restarting the service");
+    write_update_state(&format!("установлена {}, перезапуск", rel.version));
     std::process::Command::new(&exe).args(["service", "restart"]).spawn()?;
     Ok(true)
+}
+
+/// What the service's updater is doing, as the app shows it.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct UpdateStatus {
+    pub version: String,
+    pub state: String,
+    pub at: String,
+}
+
+fn update_status_path() -> std::path::PathBuf {
+    config::machine_logs_dir().join("service-update.json")
+}
+
+fn write_update_state(state: &str) {
+    let status = UpdateStatus {
+        version: crate::update::Version::current().to_string(),
+        state: state.to_string(),
+        at: config::now_rfc3339(),
+    };
+    if let Ok(text) = serde_json::to_string(&status) {
+        let _ = std::fs::write(update_status_path(), text);
+    }
+}
+
+/// The service's version and update state (readable by every user, like the logs).
+pub fn update_status() -> Option<UpdateStatus> {
+    serde_json::from_str(&std::fs::read_to_string(update_status_path()).ok()?).ok()
+}
+
+/// Service control code that makes the service check for updates now.
+const CHECK_EVENT: UserEventCode = unsafe { UserEventCode::from_unchecked(131) };
+
+/// Asks the service to check for updates now (interactive users may send user-defined controls).
+pub fn request_update_check() -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::USER_DEFINED_CONTROL)?;
+    service.notify(CHECK_EVENT)?;
+    Ok(())
 }
 
 /// Service state for the GUI/CLI; `None` when not installed or not queryable.
@@ -442,6 +500,12 @@ fn run_service() -> Result<()> {
         }
         ServiceControl::UserEvent(code) if code == SAS_EVENT => {
             send_sas();
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::UserEvent(code) if code == CHECK_EVENT => {
+            if let Some(tx) = CHECK_NOW.get() {
+                let _ = tx.send(());
+            }
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
