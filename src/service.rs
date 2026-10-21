@@ -291,6 +291,44 @@ pub fn run_elevated(action: &str) -> Result<()> {
     }
 }
 
+/// Stops and starts the service again (run as a separate process by the self-updater).
+pub fn restart() -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service =
+        manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::QUERY_STATUS)?;
+    stop_and_wait(&service)?;
+    service.start::<&str>(&[])?;
+    Ok(())
+}
+
+/// Checks GitHub for a signed release every 6 hours (first time shortly after start). When one is
+/// found it replaces the installed program and restarts the service from a separate process.
+fn spawn_updater() {
+    let _ = std::thread::Builder::new().name("updater".into()).spawn(|| {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        std::thread::sleep(Duration::from_secs(120));
+        loop {
+            match rt.block_on(update_once()) {
+                Ok(true) => return, // restarting into the new version
+                Ok(false) => {}
+                Err(e) => tracing::warn!("update check failed: {e:#}"),
+            }
+            std::thread::sleep(crate::update::CHECK_INTERVAL);
+        }
+    });
+}
+
+async fn update_once() -> Result<bool> {
+    let Some(rel) = crate::update::newer_release().await? else { return Ok(false) };
+    tracing::info!(version = %rel.version, "new release, downloading");
+    let staged = crate::update::download(&rel, &crate::update::staging_dir(true)).await?;
+    let exe = std::env::current_exe()?;
+    crate::update::install(&staged, &exe)?;
+    tracing::info!(version = %rel.version, "update installed, restarting the service");
+    std::process::Command::new(&exe).args(["service", "restart"]).spawn()?;
+    Ok(true)
+}
+
 /// Service state for the GUI/CLI; `None` when not installed or not queryable.
 pub fn status() -> Option<ServiceState> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
@@ -337,7 +375,8 @@ fn run_service() -> Result<()> {
         });
     };
     report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN);
-    tracing::info!("service started");
+    tracing::info!(version = %crate::update::Version::current(), "service started");
+    spawn_updater();
 
     // The helper inherits this and keeps its key, secret and journal in the machine directory.
     unsafe { std::env::set_var("PANDA_HOME", config::machine_dir()) };

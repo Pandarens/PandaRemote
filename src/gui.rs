@@ -23,6 +23,7 @@ use crate::{
     media::annotate::{self, DrawEvent, Ink},
     proto::{ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, Profile},
     ticket::Ticket,
+    update::{self, Version},
     yuv_render::{self, PendingFrame},
 };
 
@@ -87,6 +88,24 @@ struct App {
     presence: Arc<Mutex<HashMap<iroh::EndpointId, Presence>>>,
     /// Hosts the background checker pings (follows `hosts`).
     ping_targets: Arc<Mutex<Vec<iroh::EndpointId>>>,
+    update: Arc<Mutex<UpdateState>>,
+    /// Wakes the update checker early ("check now").
+    update_now: Arc<tokio::sync::Notify>,
+    /// Our executable's modification time at start: when the service replaces it, we restart too.
+    exe_mtime: Option<std::time::SystemTime>,
+    exe_checked: Instant,
+}
+
+/// Where the self-update stands (shown on "this PC", acted on when no session is open).
+#[derive(Clone)]
+enum UpdateState {
+    Checking,
+    UpToDate,
+    /// Downloaded and verified, waiting to be installed.
+    Ready(Version, std::path::PathBuf),
+    /// Newer release exists, but this copy lives where only the service may replace it.
+    ByService(Version),
+    Failed(String),
 }
 
 #[derive(Clone)]
@@ -241,7 +260,12 @@ impl App {
             settings,
             presence: Arc::default(),
             ping_targets: Arc::default(),
+            update: Arc::new(Mutex::new(UpdateState::Checking)),
+            update_now: Arc::default(),
+            exe_mtime: exe_mtime(),
+            exe_checked: Instant::now(),
         };
+        app.spawn_update_checker();
         *app.ping_targets.lock().unwrap() = app.host_ids();
         app.spawn_presence_checker();
         if app.settings.host_enabled && !config::service_installed() {
@@ -251,6 +275,61 @@ impl App {
             app.start_session("Удалённый ПК".into(), t.encode(), profile);
         }
         app
+    }
+
+    /// Looks for a signed release at start and every 6 hours (or when asked) and downloads it.
+    fn spawn_update_checker(&self) {
+        let (state, wake, ctx) = (self.update.clone(), self.update_now.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            loop {
+                *state.lock().unwrap() = UpdateState::Checking;
+                ctx.request_repaint();
+                let next = match update::newer_release().await {
+                    Ok(None) => UpdateState::UpToDate,
+                    Ok(Some(rel)) if !update::can_replace_self() => UpdateState::ByService(rel.version),
+                    Ok(Some(rel)) => match update::download(&rel, &update::staging_dir(false)).await {
+                        Ok(path) => UpdateState::Ready(rel.version, path),
+                        Err(e) => UpdateState::Failed(format!("{e:#}")),
+                    },
+                    Err(e) => UpdateState::Failed(format!("{e:#}")),
+                };
+                *state.lock().unwrap() = next;
+                ctx.request_repaint();
+                tokio::select! {
+                    _ = tokio::time::sleep(update::CHECK_INTERVAL) => {}
+                    _ = wake.notified() => {}
+                }
+            }
+        });
+    }
+
+    /// Installs a downloaded update and restarts into it — only between sessions, never mid-session.
+    fn maybe_apply_update(&mut self, force: bool) {
+        if self.desktop.is_some() {
+            return;
+        }
+        let ready = match &*self.update.lock().unwrap() {
+            UpdateState::Ready(v, path) => Some((*v, path.clone())),
+            _ => None,
+        };
+        if let Some((version, path)) = ready {
+            let result =
+                std::env::current_exe().map_err(anyhow::Error::from).and_then(|exe| update::install(&path, &exe));
+            match result.and_then(|()| update::relaunch(&[])) {
+                Ok(()) => {
+                    tracing::info!(%version, "restarting into the update");
+                    std::process::exit(0);
+                }
+                Err(e) => *self.update.lock().unwrap() = UpdateState::Failed(format!("{e:#}")),
+            }
+        }
+        // The service updates the installed copy we may be running from: follow it.
+        if (force || self.exe_checked.elapsed() > Duration::from_secs(60)) && self.exe_mtime.is_some() {
+            self.exe_checked = Instant::now();
+            if exe_mtime() != self.exe_mtime && update::relaunch(&[]).is_ok() {
+                std::process::exit(0);
+            }
+        }
     }
 
     fn host_ids(&self) -> Vec<iroh::EndpointId> {
@@ -688,6 +767,44 @@ impl App {
             }
         });
 
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("Panda {}", Version::current())).strong());
+                let state = self.update.lock().unwrap().clone();
+                match &state {
+                    UpdateState::Checking => {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("проверка обновлений…").weak());
+                    }
+                    UpdateState::UpToDate => {
+                        ui.label(egui::RichText::new("последняя версия").weak());
+                    }
+                    UpdateState::Ready(v, _) => {
+                        ui.label(egui::RichText::new(format!("загружена {v}")).color(GREEN));
+                    }
+                    UpdateState::ByService(v) => {
+                        ui.label(egui::RichText::new(format!("вышла {v}: служба обновит программу сама")).weak());
+                    }
+                    UpdateState::Failed(e) => {
+                        ui.label(egui::RichText::new("не удалось проверить обновления").color(YELLOW)).on_hover_text(e);
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if matches!(state, UpdateState::Ready(..)) {
+                        if ui.add(primary_button("Обновить сейчас")).on_hover_text("Перезапустит Panda").clicked()
+                        {
+                            self.maybe_apply_update(true);
+                        }
+                    } else if ui
+                        .add_enabled(!matches!(state, UpdateState::Checking), egui::Button::new("Проверить"))
+                        .clicked()
+                    {
+                        self.update_now.notify_one();
+                    }
+                });
+            });
+        });
+
         egui::CollapsingHeader::new("Журнал подключений").default_open(false).show(ui, |ui| {
             if self.this_pc.journal_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
                 self.this_pc.journal = config::read_journal(50);
@@ -953,6 +1070,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_events();
+        self.maybe_apply_update(false);
 
         if self.desktop.is_some() {
             self.desktop_view(ui);
@@ -1001,6 +1119,10 @@ impl eframe::App for App {
             Tab::ThisPc => self.this_pc_tab(ui),
         });
     }
+}
+
+fn exe_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(std::env::current_exe().ok()?).ok()?.modified().ok()
 }
 
 // ---------- look ----------

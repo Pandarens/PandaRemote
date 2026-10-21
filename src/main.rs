@@ -11,6 +11,7 @@ mod proto;
 #[cfg(windows)]
 mod service;
 mod ticket;
+mod update;
 mod yuv_render;
 
 use std::sync::Arc;
@@ -58,6 +59,14 @@ enum Command {
     Log,
     /// Проверить, в сети ли компьютер с этим билетом
     Ping { ticket: String },
+    /// Проверить обновления на GitHub и установить, если есть
+    Update,
+    /// Выпуск: создать ключ подписи (приватный — в файл, публичный — на экран)
+    #[command(hide = true)]
+    ReleaseKeygen { out: std::path::PathBuf },
+    /// Выпуск: подписать файл ключом из PANDA_SIGNING_KEY (пишет <файл>.sig)
+    #[command(hide = true)]
+    ReleaseSign { file: std::path::PathBuf },
     /// Диагностика: скорость H.264-энкодера на синтетических кадрах 1080p
     #[command(hide = true)]
     BenchEncoder {
@@ -103,6 +112,9 @@ enum ServiceAction {
     /// Точка входа службы (запускается Windows)
     #[command(hide = true)]
     Run,
+    /// Перезапустить службу (после самообновления)
+    #[command(hide = true)]
+    Restart,
 }
 
 fn init_logging(cli: &Cli) {
@@ -143,7 +155,12 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     match cli.command {
-        None => gui::run(rt, None, cli.minimized),
+        None => {
+            if update::apply_staged_on_start() {
+                return Ok(());
+            }
+            gui::run(rt, None, cli.minimized)
+        }
         Some(Command::Connect { ticket, game }) => {
             gui::run(rt, Some((ticket::Ticket::decode(&ticket)?, profile(game))), cli.minimized)
         }
@@ -153,6 +170,34 @@ fn main() -> Result<()> {
             println!("{}", t.encode());
             Ok(())
         }
+        Some(Command::ReleaseKeygen { out }) => {
+            let key = iroh::SecretKey::generate();
+            std::fs::write(&out, data_encoding::HEXLOWER.encode(&key.to_bytes()))?;
+            println!("{}", data_encoding::HEXLOWER.encode(key.public().as_bytes()));
+            Ok(())
+        }
+        Some(Command::ReleaseSign { file }) => {
+            let secret =
+                std::env::var("PANDA_SIGNING_KEY").map_err(|_| anyhow::anyhow!("PANDA_SIGNING_KEY is not set"))?;
+            let sig = update::sign(&std::fs::read(&file)?, update::Version::current(), &secret)?;
+            let mut sig_path = file.into_os_string();
+            sig_path.push(".sig");
+            std::fs::write(&sig_path, sig)?;
+            Ok(())
+        }
+        Some(Command::Update) => rt.block_on(async {
+            println!("Текущая версия: {}", update::Version::current());
+            match update::newer_release().await? {
+                None => println!("Установлена последняя версия."),
+                Some(rel) => {
+                    println!("Доступна {}: скачиваю и проверяю подпись…", rel.version);
+                    let staged = update::download(&rel, &update::staging_dir(false)).await?;
+                    update::install(&staged, &std::env::current_exe()?)?;
+                    println!("Обновлено до {}. Перезапустите Panda.", rel.version);
+                }
+            }
+            Ok(())
+        }),
         Some(Command::Ping { ticket }) => rt.block_on(async {
             let ticket = ticket::Ticket::decode(&ticket)?;
             match client::ping(ticket.host_id).await {
@@ -195,6 +240,7 @@ fn main() -> Result<()> {
                 Ok(())
             }
             ServiceAction::Run => service::run_dispatcher(),
+            ServiceAction::Restart => service::restart(),
         },
         Some(Command::Host { rotate_secret, service_helper }) => rt.block_on(async {
             // Two hosts with one key would fight over the relay; the service already serves this PC.

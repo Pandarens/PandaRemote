@@ -1,0 +1,39 @@
+# Builds, signs and publishes a release when a version tag (v1.2.3) is pushed.
+# Panda installs only releases whose signature matches the key built into it (src/update.rs);
+# the private half lives in the PANDA_SIGNING_KEY repository secret.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag must match the crate version
+        shell: bash
+        run: |
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "v$crate" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml $crate"; exit 1; }
+
+      - run: cargo test --release
+      - run: cargo build --release
+
+      - name: Sign
+        env:
+          PANDA_SIGNING_KEY: ${{ secrets.PANDA_SIGNING_KEY }}
+        run: target/release/panda-rc.exe release-sign target/release/panda-rc.exe
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/panda-rc.exe
+            target/release/panda-rc.exe.sig
