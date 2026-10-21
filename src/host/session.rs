@@ -64,6 +64,9 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
     let input_tx = input::spawn();
     let mut abr = Abr { current: start_bitrate, min: min_bitrate, max: max_bitrate, clean_seconds: 0 };
 
+    // Created on the first drawing event, so sessions that never draw don't put a window on screen.
+    #[cfg(windows)]
+    let mut overlay: Option<std::sync::mpsc::Sender<crate::media::annotate::DrawEvent>> = None;
     let control_loop = async {
         loop {
             match proto::read_msg::<ClientMsg>(&mut recv).await? {
@@ -74,6 +77,14 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
                     if let Some(tx) = &pad_tx {
                         let _ = tx.send(state);
                     }
+                }
+                ClientMsg::Draw(ev) => {
+                    #[cfg(windows)]
+                    {
+                        let _ = overlay.get_or_insert_with(super::overlay::spawn).send(ev);
+                    }
+                    #[cfg(not(windows))]
+                    let _ = ev;
                 }
                 ClientMsg::RequestKeyframe => control.keyframe.store(true, Ordering::Relaxed),
                 ClientMsg::Stats { frames, lost } => {

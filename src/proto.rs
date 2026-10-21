@@ -59,6 +59,8 @@ pub enum ClientMsg {
     },
     Input(InputEvent),
     Gamepad(GamepadState),
+    /// Drawing over the host's screen (shown to the remote user, fades by itself).
+    Draw(crate::media::annotate::DrawEvent),
     RequestKeyframe,
     /// Sent once a second: frames assembled and frames lost since the previous report.
     Stats {

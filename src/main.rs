@@ -260,12 +260,25 @@ fn main() -> Result<()> {
                     use proto::{ClientMsg::Input, InputEvent::*, MouseButton};
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     // Test input only ever goes to the lock screen, never into someone's open windows.
-                    if !shared.secure_desktop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Drawing is not input (it only shows an overlay), so it is always allowed.
+                    let draw_only = actions.split(',').all(|a| a.trim() == "draw");
+                    if !draw_only && !shared.secure_desktop.load(std::sync::atomic::Ordering::Relaxed) {
                         println!("Действия пропущены: хост не на экране блокировки");
                         return;
                     }
                     for action in actions.split(',').map(str::trim) {
-                        if action == "click" {
+                        if action == "draw" {
+                            // A diagonal stroke across the middle, left unfinished so it stays visible.
+                            for i in 0..=20u32 {
+                                let v = (20000 + i * 1250) as u16;
+                                let _ = tx.send(proto::ClientMsg::Draw(media::annotate::DrawEvent::Point {
+                                    stroke: 1,
+                                    x: v,
+                                    y: v,
+                                    color: media::annotate::COLORS[0],
+                                }));
+                            }
+                        } else if action == "click" {
                             let _ = tx.send(Input(MouseMove { x: 32768, y: 32768 }));
                             let _ = tx
                                 .send(Input(proto::InputEvent::MouseButton { button: MouseButton::Left, down: true }));

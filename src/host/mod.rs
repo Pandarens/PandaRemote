@@ -10,6 +10,8 @@ mod dxgi;
 pub mod encoder;
 mod gamepad;
 mod input;
+#[cfg(windows)]
+mod overlay;
 mod session;
 
 use std::{
