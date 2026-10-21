@@ -16,8 +16,6 @@ const MAX_FRAME: usize = 32 * 1024 * 1024;
 pub enum SessionKind {
     /// Built-in remote desktop (screen + mouse/keyboard).
     Desktop,
-    /// Port tunnel to the host's Sunshine for Moonlight game streaming.
-    GameTunnel,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -98,14 +96,7 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
 }
 
-/// Header written at the start of each tunnelled TCP stream.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct TcpOpen {
-    /// Offset from Sunshine's base port (client and host may use different bases).
-    pub offset: i16,
-}
-
-/// Endpoint with the given identity, n0 address lookup + relays, and buffers sized for game streaming.
+/// Endpoint with the given identity, n0 address lookup + relays, and buffers sized for streaming.
 pub async fn bind_endpoint(key: SecretKey) -> Result<Endpoint> {
     let transport = QuicTransportConfig::builder()
         .datagram_receive_buffer_size(Some(8 * 1024 * 1024))

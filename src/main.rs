@@ -7,7 +7,6 @@ mod gui;
 mod host;
 mod proto;
 mod ticket;
-mod tunnel;
 
 use std::sync::Arc;
 
@@ -31,8 +30,6 @@ enum Command {
     },
     /// Показать билет подключения к этому ПК
     Ticket,
-    /// Поднять игровой туннель к хосту: затем в Moonlight добавьте ПК 127.0.0.1
-    Game { ticket: String },
     /// Открыть окно удалённого рабочего стола
     Connect { ticket: String },
     /// Показать журнал подключений к этому ПК
@@ -112,21 +109,6 @@ fn main() -> Result<()> {
                     Ok(())
                 }
                 None => anyhow::bail!("кадры не получены"),
-            }
-        }),
-        Some(Command::Game { ticket }) => rt.block_on(async {
-            let ticket = ticket::Ticket::decode(&ticket)?;
-            println!("Подключение к хосту…");
-            let session = client::connect(&ticket, proto::SessionKind::GameTunnel).await?;
-            println!(
-                "Туннель к «{}» поднят ({}).\nОткройте Moonlight → добавьте ПК вручную: 127.0.0.1",
-                session.host_name,
-                client::path_summary(&session.conn)
-            );
-            let stats = Arc::new(tunnel::TunnelStats::default());
-            tokio::select! {
-                r = tunnel::run_client(session.conn, session.send, 47989, stats) => r,
-                _ = tokio::signal::ctrl_c() => Ok(()),
             }
         }),
     }

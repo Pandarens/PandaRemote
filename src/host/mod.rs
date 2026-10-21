@@ -1,5 +1,5 @@
 //! Host side: accepts connections addressed to this machine's key, authenticates them
-//! and runs either a remote-desktop session or a Sunshine game tunnel.
+//! and runs a streaming session.
 
 mod capture;
 mod desktop;
@@ -20,7 +20,6 @@ use crate::{
     config::{self, HostConfig},
     proto::{self, ClientMsg, HostMsg, PROTOCOL_VERSION, SessionKind},
     ticket::Ticket,
-    tunnel,
 };
 
 pub struct Host {
@@ -115,13 +114,11 @@ impl Handler {
 
         let kind_name = match kind {
             SessionKind::Desktop => "desktop",
-            SessionKind::GameTunnel => "game",
         };
         config::journal(&cid, &client_name, "connected", kind_name);
         let started = Instant::now();
         let result = match kind {
             SessionKind::Desktop => desktop::serve(&conn, send, recv).await,
-            SessionKind::GameTunnel => tunnel::serve_host(&conn, recv, self.cfg.sunshine_port).await,
         };
         let detail = match &result {
             Ok(()) => format!("{kind_name}, {} с", started.elapsed().as_secs()),

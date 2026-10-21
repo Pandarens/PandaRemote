@@ -71,13 +71,6 @@ pub struct HostConfig {
     pub name: String,
     #[serde(with = "hex32")]
     pub access_secret: [u8; 32],
-    /// Base port of the local Sunshine instance (game streaming tunnel).
-    #[serde(default = "default_sunshine_port")]
-    pub sunshine_port: u16,
-}
-
-fn default_sunshine_port() -> u16 {
-    47989
 }
 
 impl HostConfig {
@@ -89,7 +82,6 @@ impl HostConfig {
         let cfg = HostConfig {
             name: machine_name(),
             access_secret: random_bytes(),
-            sunshine_port: default_sunshine_port(),
         };
         cfg.save()?;
         Ok(cfg)

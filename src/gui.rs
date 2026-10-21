@@ -1,9 +1,8 @@
-//! Desktop GUI (eframe/egui): saved hosts, game tunnel, remote-desktop viewer, "this PC" host panel.
+//! Desktop GUI (eframe/egui): saved hosts, remote-desktop viewer, "this PC" host panel.
 
 use std::{
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc,
         mpsc,
     },
     time::{Duration, Instant},
@@ -19,7 +18,6 @@ use crate::{
     host::Host,
     proto::{ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, SessionKind},
     ticket::Ticket,
-    tunnel::{self, TunnelStats},
 };
 
 pub fn run(rt: Runtime, initial: Option<Ticket>) -> Result<()> {
@@ -42,7 +40,6 @@ enum UiEvent {
     HostOnline,
     Connected { ticket: String },
     DesktopEnded(Option<String>),
-    GameEnded(Option<String>),
 }
 
 #[derive(PartialEq)]
@@ -65,7 +62,6 @@ struct App {
 
     this_pc: ThisPc,
     desktop: Option<DesktopView>,
-    game: Option<GameView>,
 }
 
 struct ThisPc {
@@ -76,8 +72,6 @@ struct ThisPc {
     confirm_rotate: bool,
     journal: Vec<JournalEntry>,
     journal_at: Option<Instant>,
-    sunshine_up: Arc<AtomicBool>,
-    sunshine_checked: Option<Instant>,
 }
 
 struct DesktopView {
@@ -89,13 +83,6 @@ struct DesktopView {
     last_pos: Option<(u16, u16)>,
     wheel: Vec2,
     fullscreen: bool,
-}
-
-struct GameView {
-    name: String,
-    status: Arc<Mutex<String>>,
-    stats: Arc<TunnelStats>,
-    task: JoinHandle<()>,
 }
 
 impl App {
@@ -119,11 +106,8 @@ impl App {
                 confirm_rotate: false,
                 journal: Vec::new(),
                 journal_at: None,
-                sunshine_up: Arc::new(AtomicBool::new(false)),
-                sunshine_checked: None,
             },
             desktop: None,
-            game: None,
         };
         if let Some(t) = initial {
             app.start_desktop("Удалённый ПК".into(), t.encode());
@@ -168,12 +152,6 @@ impl App {
                         None => (false, "Сеанс завершён".into()),
                     });
                 }
-                UiEvent::GameEnded(err) => {
-                    self.game = None;
-                    if let Some(e) = err {
-                        self.message = Some((true, format!("Игровой туннель остановлен: {e}")));
-                    }
-                }
             }
         }
     }
@@ -217,41 +195,6 @@ impl App {
         });
     }
 
-    fn start_game(&mut self, name: String, ticket_str: String) {
-        let ticket = match Ticket::decode(&ticket_str) {
-            Ok(t) => t,
-            Err(e) => {
-                self.message = Some((true, format!("{e:#}")));
-                return;
-            }
-        };
-        let status = Arc::new(Mutex::new("Подключение…".to_string()));
-        let stats = Arc::new(TunnelStats::default());
-        let send = self.send_event();
-        let (status2, stats2, ctx) = (status.clone(), stats.clone(), self.ctx.clone());
-        let task = self.rt.spawn(async move {
-            let res = async {
-                let session = client::connect(&ticket, SessionKind::GameTunnel).await?;
-                send(UiEvent::Connected { ticket: ticket_str });
-                let conn = session.conn.clone();
-                let ticker = async {
-                    loop {
-                        *status2.lock().unwrap() = format!("Туннель к «{}» активен · {}", session.host_name, client::path_summary(&conn));
-                        ctx.request_repaint();
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                };
-                tokio::select! {
-                    r = tunnel::run_client(session.conn.clone(), session.send, 47989, stats2) => r,
-                    _ = ticker => Ok(()),
-                }
-            }
-            .await;
-            send(UiEvent::GameEnded(res.err().map(|e| format!("{e:#}"))));
-        });
-        self.game = Some(GameView { name, status, stats, task });
-    }
-
     fn start_host(&mut self) {
         self.this_pc.starting = true;
         self.this_pc.online = false;
@@ -284,29 +227,6 @@ impl App {
         ui.heading("Мои компьютеры");
         ui.add_space(6.0);
 
-        if let Some(game) = &self.game {
-            let mut stop = false;
-            egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
-                ui.label(egui::RichText::new(format!("🎮 Игровой режим: {}", game.name)).strong());
-                ui.label(game.status.lock().unwrap().clone());
-                ui.label(format!(
-                    "Трафик: ↑ {:.1} МБ  ↓ {:.1} МБ",
-                    game.stats.up.load(Ordering::Relaxed) as f64 / 1e6,
-                    game.stats.down.load(Ordering::Relaxed) as f64 / 1e6
-                ));
-                ui.label("Откройте Moonlight → «Добавить ПК вручную» → 127.0.0.1. При первом подключении введите PIN в веб-панели Sunshine на удалённом ПК.");
-                if ui.button("Остановить туннель").clicked() {
-                    stop = true;
-                }
-            });
-            if stop {
-                if let Some(g) = self.game.take() {
-                    g.task.abort();
-                }
-            }
-            ui.add_space(8.0);
-        }
-
         let mut action: Option<(usize, &'static str)> = None;
         if self.hosts.is_empty() {
             ui.label("Пока пусто. Запустите хост на удалённом ПК (вкладка «Этот компьютер»), скопируйте билет и добавьте его ниже.");
@@ -320,9 +240,6 @@ impl App {
                 if ui.button("🖥 Рабочий стол").clicked() {
                     action = Some((i, "desktop"));
                 }
-                if ui.add_enabled(self.game.is_none(), egui::Button::new("🎮 Игра (Moonlight)")).clicked() {
-                    action = Some((i, "game"));
-                }
                 if ui.button("🗑").on_hover_text("Удалить").clicked() {
                     action = Some((i, "delete"));
                 }
@@ -333,7 +250,6 @@ impl App {
             let h = self.hosts[i].clone();
             match what {
                 "desktop" => self.start_desktop(h.name, h.ticket),
-                "game" => self.start_game(h.name, h.ticket),
                 _ => {
                     self.hosts.remove(i);
                     let _ = config::save_hosts(&self.hosts);
@@ -430,25 +346,6 @@ impl App {
                     }
                 }
             });
-        }
-
-        // Sunshine availability (game mode on this PC).
-        let due = self.this_pc.sunshine_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(5));
-        if due {
-            self.this_pc.sunshine_checked = Some(Instant::now());
-            let (flag, port) = (self.this_pc.sunshine_up.clone(), HostConfig::load_or_create().map(|c| c.sunshine_port).unwrap_or(47989));
-            self.rt.spawn(async move {
-                let ok = tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(("127.0.0.1", port)))
-                    .await
-                    .is_ok_and(|r| r.is_ok());
-                flag.store(ok, Ordering::Relaxed);
-            });
-        }
-        ui.add_space(8.0);
-        if self.this_pc.sunshine_up.load(Ordering::Relaxed) {
-            ui.label("🎮 Sunshine найден — игровой режим доступен.");
-        } else {
-            ui.label("🎮 Sunshine не запущен — для игр установите Sunshine (github.com/LizardByte/Sunshine).");
         }
 
         ui.add_space(12.0);

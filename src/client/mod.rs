@@ -1,4 +1,4 @@
-//! Client side: dial a host by its key, authenticate, then run a desktop viewer or a game tunnel.
+//! Client side: dial a host by its key, authenticate, then run a streaming session.
 
 pub mod viewer;
 
