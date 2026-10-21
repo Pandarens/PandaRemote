@@ -139,7 +139,7 @@ impl Handler {
         let cid = client_id.to_string();
         let (mut send, mut recv) = conn.accept_bi().await?;
 
-        let ClientMsg::Hello { version, client_name, profile } = proto::read_msg(&mut recv).await? else {
+        let ClientMsg::Hello { version, client_name, profile, monitor } = proto::read_msg(&mut recv).await? else {
             bail!("expected Hello");
         };
         let nonce = config::random_bytes();
@@ -181,7 +181,7 @@ impl Handler {
         let kind_name = profile.name();
         config::journal(&cid, &client_name, "connected", kind_name);
         let started = Instant::now();
-        let result = session::serve(&conn, profile, send, recv).await;
+        let result = session::serve(&conn, profile, monitor, send, recv).await;
         let detail = match &result {
             Ok(()) => format!("{kind_name}, {} с", started.elapsed().as_secs()),
             Err(e) => format!("{kind_name}, {} с, {e:#}", started.elapsed().as_secs()),

@@ -32,6 +32,7 @@ pub enum Icon {
     ChevronDown,
     Rename,
     Trash,
+    Check,
 }
 
 const LINE: &str = r#"fill="none" stroke="white" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round""#;
@@ -90,6 +91,7 @@ impl Icon {
             Icon::Chevron => line(r#"<path d="M9 6l6 6-6 6"/>"#),
             Icon::ChevronDown => line(r#"<path d="M6 9l6 6 6-6"/>"#),
             Icon::Rename => line(r#"<path d="M4 20h4L19 9l-4-4L4 16z"/>"#),
+            Icon::Check => line(r#"<path d="M5 12.5l4.5 4.5L19 7.5"/>"#),
             Icon::Trash => line(r#"<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>"#),
         }
     }
@@ -161,6 +163,7 @@ mod tests {
             Icon::ChevronDown,
             Icon::Rename,
             Icon::Trash,
+            Icon::Check,
         ] {
             let img = icon.rasterize(32);
             let ink = img.pixels.iter().filter(|p| p.a() > 0).count();

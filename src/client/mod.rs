@@ -48,7 +48,7 @@ impl std::fmt::Display for PinError {
 
 impl std::error::Error for PinError {}
 
-pub async fn connect(ticket: &Ticket, profile: Profile, pin: Option<&str>) -> Result<Session> {
+pub async fn connect(ticket: &Ticket, profile: Profile, pin: Option<&str>, monitor: Option<u8>) -> Result<Session> {
     let ep = endpoint().await?;
     let conn = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(ticket.host_id, proto::ALPN))
         .await
@@ -56,7 +56,7 @@ pub async fn connect(ticket: &Ticket, profile: Profile, pin: Option<&str>) -> Re
         .context("не удалось соединиться с хостом")?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
-    let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, client_name: config::machine_name(), profile };
+    let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, client_name: config::machine_name(), profile, monitor };
     proto::write_msg(&mut send, &hello).await?;
     let HostMsg::Challenge { nonce, host_name } = proto::read_msg(&mut recv).await? else {
         bail!("unexpected message from host");

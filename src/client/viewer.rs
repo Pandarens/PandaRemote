@@ -17,7 +17,7 @@ use crate::{
         audio as audio_pkt,
         fec::{self, Frame, Reassembler},
     },
-    proto::{self, ClientMsg, HostMsg},
+    proto::{self, ClientMsg, GamepadState, HostMsg, InputEvent},
 };
 
 /// Decoded picture in NV12: full-resolution luma plus interleaved half-resolution chroma, tightly packed.
@@ -49,6 +49,10 @@ pub struct Shared {
     pub secure_desktop: AtomicBool,
     /// Where host vibration requests go (set by the GUI in the game profile).
     pub rumble: Mutex<Option<super::gamepad::RumbleSender>>,
+    /// View only: input and gamepad are not sent (releases still are, so nothing stays held down).
+    pub view_only: AtomicBool,
+    /// The host's monitors and the index of the streamed one.
+    pub monitors: Mutex<(Vec<String>, u8)>,
     pub decoded: AtomicU32,
     assembled: AtomicU32,
     lost: AtomicU32,
@@ -56,6 +60,20 @@ pub struct Shared {
 }
 
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
+
+/// In view-only mode: only releases (so no key, button or stick stays held) and non-input messages go out.
+fn allowed_when_viewing(msg: &ClientMsg) -> bool {
+    match msg {
+        ClientMsg::Input(
+            InputEvent::MouseButton { down: false, .. }
+            | InputEvent::Key { down: false, .. }
+            | InputEvent::Scancode { down: false, .. },
+        ) => true,
+        ClientMsg::Input(_) | ClientMsg::SecureAttention => false,
+        ClientMsg::Gamepad(state) => *state == GamepadState::default(),
+        _ => true,
+    }
+}
 
 pub async fn run(
     session: Session,
@@ -66,12 +84,13 @@ pub async fn run(
     play_audio: bool,
 ) -> Result<()> {
     let Session { conn, mut send, mut recv, .. } = session;
-    let HostMsg::StreamInfo { width, height, fps, encoder, audio: has_audio, gamepad_error } =
+    let HostMsg::StreamInfo { width, height, fps, encoder, audio: has_audio, gamepad_error, monitors, monitor } =
         proto::read_msg(&mut recv).await?
     else {
         anyhow::bail!("expected StreamInfo");
     };
     *shared.notice.lock().unwrap() = gamepad_error;
+    *shared.monitors.lock().unwrap() = (monitors, monitor);
     let audio_tx = (has_audio && play_audio).then(audio::spawn);
     tracing::info!(width, height, fps, %encoder, "stream info");
 
@@ -136,6 +155,9 @@ pub async fn run(
     };
     let transmit = async {
         while let Some(msg) = out_rx.recv().await {
+            if shared.view_only.load(Ordering::Relaxed) && !allowed_when_viewing(&msg) {
+                continue;
+            }
             proto::write_msg(&mut send, &msg).await?;
         }
         anyhow::Ok(())

@@ -29,7 +29,7 @@ use windows_service::{
     define_windows_service,
     service::{
         ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
-        ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        ServiceStartType, ServiceState, ServiceStatus, ServiceType, UserEventCode,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
@@ -109,6 +109,11 @@ fn deploy(manager: &ServiceManager, existing: Option<&windows_service::service::
         }
     }
 
+    // Ctrl+Alt+Del from the viewer: Windows lets services press it only when this policy allows them to.
+    if let Err(e) = allow_service_sas() {
+        tracing::warn!("Ctrl+Alt+Del will not work: {e:#}");
+    }
+
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: "Panda Remote".into(),
@@ -166,6 +171,24 @@ fn lock_down(root: &std::path::Path) -> Result<()> {
         icacls(&dir, &["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/Q"])?;
     }
     let _ = icacls(root, &["/setowner", ADMINS, "/T", "/C", "/Q"]);
+    Ok(())
+}
+
+/// Sets the `SoftwareSASGeneration` policy to "services" (1) unless it already allows them (1 or 3).
+fn allow_service_sas() -> Result<()> {
+    const KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+    let query = std::process::Command::new("reg").args(["query", KEY, "/v", "SoftwareSASGeneration"]).output()?;
+    let current = String::from_utf8_lossy(&query.stdout);
+    if current.contains("0x1") || current.contains("0x3") {
+        return Ok(());
+    }
+    let out = std::process::Command::new("reg")
+        .args(["add", KEY, "/v", "SoftwareSASGeneration", "/t", "REG_DWORD", "/d", "1", "/f"])
+        .output()
+        .context("reg")?;
+    if !out.status.success() {
+        bail!("reg add failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
     Ok(())
 }
 
@@ -228,6 +251,43 @@ pub fn uninstall() -> Result<()> {
         let _ = std::fs::remove_file(exe);
     }
     Ok(())
+}
+
+/// Service control code the session helper sends to have the service press Ctrl+Alt+Del.
+const SAS_EVENT: UserEventCode = unsafe { UserEventCode::from_unchecked(130) };
+
+/// Asks the service to press Ctrl+Alt+Del. Windows lets only a service do that (`SendSAS`), and the host
+/// runs in a helper process in the user's session, so it passes the request on.
+pub fn request_sas() -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("Ctrl+Alt+Del работает только со службой Windows")?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::USER_DEFINED_CONTROL)
+        .context("Ctrl+Alt+Del работает только со службой Windows")?;
+    service.notify(SAS_EVENT)?;
+    Ok(())
+}
+
+/// Presses Ctrl+Alt+Del (the secure attention sequence) from the service.
+fn send_sas() {
+    use windows::{
+        Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW},
+        core::{s, w},
+    };
+    unsafe {
+        let Ok(lib) = LoadLibraryW(w!("sas.dll")) else {
+            tracing::warn!("sas.dll not found");
+            return;
+        };
+        let Some(proc) = GetProcAddress(lib, s!("SendSAS")) else {
+            tracing::warn!("SendSAS not found");
+            return;
+        };
+        let send_sas: unsafe extern "system" fn(i32) = std::mem::transmute(proc);
+        // FALSE: called by a service.
+        send_sas(0);
+    }
+    tracing::info!("Ctrl+Alt+Del sent");
 }
 
 /// Copies the service's host files into a user's directory `to` (the elevated copy may run as another
@@ -378,6 +438,10 @@ fn run_service() -> Result<()> {
     let handler = move |event| match event {
         ServiceControl::Stop | ServiceControl::Shutdown => {
             let _ = stop_tx.send(());
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::UserEvent(code) if code == SAS_EVENT => {
+            send_sas();
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,

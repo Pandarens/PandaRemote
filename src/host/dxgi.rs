@@ -32,32 +32,65 @@ pub struct Dxgi {
     pub bgra: Vec<u8>,
 }
 
-impl Dxgi {
-    pub fn new() -> Result<Self> {
-        unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let mut adapter_idx = 0;
-            while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
-                adapter_idx += 1;
-                let mut output_idx = 0;
-                while let Ok(output) = adapter.EnumOutputs(output_idx) {
-                    output_idx += 1;
-                    let desc = output.GetDesc()?;
-                    let r = desc.DesktopCoordinates;
-                    // The primary monitor is the one at the desktop origin.
-                    if !desc.AttachedToDesktop.as_bool() || r.left != 0 || r.top != 0 {
-                        continue;
-                    }
-                    return Self::open(
-                        &adapter,
-                        output.cast::<IDXGIOutput1>()?,
-                        (r.right - r.left) as u32,
-                        (r.bottom - r.top) as u32,
-                    );
+/// A monitor's place on the virtual desktop.
+#[derive(Clone, Copy, Debug)]
+pub struct Output {
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Output {
+    /// The primary monitor is the one at the desktop origin.
+    pub fn primary(&self) -> bool {
+        self.left == 0 && self.top == 0
+    }
+}
+
+/// Monitors attached to the desktop, in adapter/output order.
+fn enumerate() -> Result<Vec<(IDXGIAdapter1, IDXGIOutput1, Output)>> {
+    let mut found = Vec::new();
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+        let mut adapter_idx = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
+            adapter_idx += 1;
+            let mut output_idx = 0;
+            while let Ok(output) = adapter.EnumOutputs(output_idx) {
+                output_idx += 1;
+                let desc = output.GetDesc()?;
+                if !desc.AttachedToDesktop.as_bool() {
+                    continue;
                 }
+                let r = desc.DesktopCoordinates;
+                let place = Output {
+                    left: r.left,
+                    top: r.top,
+                    width: (r.right - r.left) as u32,
+                    height: (r.bottom - r.top) as u32,
+                };
+                found.push((adapter.clone(), output.cast::<IDXGIOutput1>()?, place));
             }
         }
-        bail!("primary monitor not found among DXGI outputs")
+    }
+    Ok(found)
+}
+
+/// The monitors a viewer can choose from.
+pub fn outputs() -> Vec<Output> {
+    enumerate().map(|v| v.into_iter().map(|(_, _, o)| o).collect()).unwrap_or_default()
+}
+
+impl Dxgi {
+    /// Duplicates monitor `index` of [`outputs`], or the primary one.
+    pub fn new(index: Option<usize>) -> Result<(Self, Output)> {
+        let mut all = enumerate()?;
+        let pick = index.filter(|&i| i < all.len()).or_else(|| all.iter().position(|(_, _, o)| o.primary()));
+        let Some(i) = pick else { bail!("primary monitor not found among DXGI outputs") };
+        let (adapter, output, place) = all.swap_remove(i);
+        let dxgi = unsafe { Self::open(&adapter, output, place.width, place.height)? };
+        Ok((dxgi, place))
     }
 
     unsafe fn open(adapter: &IDXGIAdapter1, output: IDXGIOutput1, width: u32, height: u32) -> Result<Self> {

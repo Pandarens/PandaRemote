@@ -90,6 +90,9 @@ enum Command {
         /// PIN-код, если компьютер его спрашивает
         #[arg(long)]
         pin: Option<String>,
+        /// Номер монитора (с 1); без него — основной
+        #[arg(long)]
+        monitor: Option<u8>,
         /// Через 2 с сдвинуть мышь хоста относительным движением и вернуть обратно (проверка ввода)
         #[arg(long, hide = true)]
         nudge: bool,
@@ -315,10 +318,11 @@ fn main() -> Result<()> {
             Ok(())
         }),
         Some(Command::BenchEncoder { sw, fps }) => bench_encoder(!sw, fps),
-        Some(Command::Probe { ticket, out, seconds, game, pin, nudge, actions }) => rt.block_on(async {
+        Some(Command::Probe { ticket, out, seconds, game, pin, monitor, nudge, actions }) => rt.block_on(async {
             let ticket = ticket::Ticket::decode(&ticket)?;
             let started = std::time::Instant::now();
-            let session = client::connect(&ticket, profile(game), pin.as_deref()).await?;
+            let session =
+                client::connect(&ticket, profile(game), pin.as_deref(), monitor.map(|m| m.saturating_sub(1))).await?;
             println!(
                 "Подключено к «{}» за {:?} ({})",
                 session.host_name,

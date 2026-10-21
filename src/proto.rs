@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Single ALPN; the stream profile is chosen in [`ClientMsg::Hello`].
 pub const ALPN: &[u8] = b"panda-rc/2";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Presence check: the host completes the handshake and closes, nothing else (no auth, no data).
 pub const PING_ALPN: &[u8] = b"panda-rc/ping";
 const MAX_FRAME: usize = 32 * 1024 * 1024;
@@ -53,6 +53,8 @@ pub enum ClientMsg {
         version: u32,
         client_name: String,
         profile: Profile,
+        /// Which monitor to stream (index into `StreamInfo::monitors`); `None` = the primary one.
+        monitor: Option<u8>,
     },
     Auth {
         mac: [u8; 32],
@@ -69,6 +71,8 @@ pub enum ClientMsg {
     },
     /// Answer to `HostMsg::PinRequired`.
     Pin(String),
+    /// Press Ctrl+Alt+Del on the host (works when the Windows service is installed).
+    SecureAttention,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -91,6 +95,10 @@ pub enum HostMsg {
         audio: bool,
         /// `None` when a virtual gamepad is available, otherwise why not.
         gamepad_error: Option<String>,
+        /// The host's monitors, as labels for the viewer to pick from.
+        monitors: Vec<String>,
+        /// Index of the streamed one in `monitors`.
+        monitor: u8,
     },
     /// Force feedback the game set on the virtual controller (0 = off).
     Rumble {

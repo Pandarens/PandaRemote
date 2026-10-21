@@ -21,7 +21,7 @@ const MAX_WIDTH: u32 = 2560;
 /// Reed-Solomon parity added to every frame.
 const PARITY_PERCENT: u32 = 20;
 
-/// Streamed frame size (the primary monitor, possibly downscaled).
+/// Streamed frame size (the chosen monitor, possibly downscaled).
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub width: u32,
@@ -31,6 +31,50 @@ pub struct Geometry {
 pub struct StreamStart {
     pub geometry: Geometry,
     pub encoder: String,
+    /// Labels of the host's monitors and the index of the streamed one.
+    pub monitors: Vec<String>,
+    pub monitor: u8,
+    /// Where the streamed monitor sits on the virtual desktop (for mouse positions); `None` = primary.
+    pub place: Option<Place>,
+}
+
+/// A monitor rectangle on the virtual desktop.
+#[derive(Clone, Copy, Debug)]
+pub struct Place {
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Labels for the viewer's monitor menu, and the index `requested` resolves to.
+fn monitor_labels(requested: Option<usize>) -> (Vec<String>, u8, Option<Place>) {
+    #[cfg(windows)]
+    {
+        let outputs = super::dxgi::outputs();
+        let labels = outputs
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let main = if o.primary() { " (основной)" } else { "" };
+                format!("Монитор {} · {}×{}{main}", i + 1, o.width, o.height)
+            })
+            .collect();
+        let chosen =
+            requested.filter(|&i| i < outputs.len()).or_else(|| outputs.iter().position(|o| o.primary())).unwrap_or(0);
+        let place = outputs.get(chosen).filter(|o| !o.primary()).map(|o| Place {
+            left: o.left,
+            top: o.top,
+            width: o.width,
+            height: o.height,
+        });
+        (labels, chosen as u8, place)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = requested;
+        (vec!["Монитор 1".into()], 0, None)
+    }
 }
 
 /// Knobs the network side turns while the capture thread runs.
@@ -50,7 +94,13 @@ enum Exit {
     DesktopChanged,
 }
 
-pub fn run(conn: Connection, profile: Profile, control: Arc<Control>, start_tx: oneshot::Sender<Result<StreamStart>>) {
+pub fn run(
+    conn: Connection,
+    profile: Profile,
+    monitor: Option<usize>,
+    control: Arc<Control>,
+    start_tx: oneshot::Sender<Result<StreamStart>>,
+) {
     let mut start_tx = Some(start_tx);
     // A thread that owns windows (the encoder may create some) cannot move to another desktop,
     // so each desktop switch gets a fresh capture thread.
@@ -58,7 +108,7 @@ pub fn run(conn: Connection, profile: Profile, control: Arc<Control>, start_tx: 
         let result = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .name("capture".into())
-                .spawn_scoped(scope, || capture_loop(&conn, profile, &control, &mut start_tx))
+                .spawn_scoped(scope, || capture_loop(&conn, profile, monitor, &control, &mut start_tx))
                 .map_err(anyhow::Error::from)
                 .and_then(|t| t.join().map_err(|_| anyhow::anyhow!("capture thread panicked"))?)
         });
@@ -91,15 +141,18 @@ enum Source {
 }
 
 impl Source {
-    fn open() -> Result<Self> {
+    /// Opens monitor `monitor` (index into the DXGI outputs) or the primary one. The GDI fallback
+    /// always captures the primary monitor.
+    fn open(monitor: Option<usize>) -> Result<Self> {
         // Lock screen / UAC live on another desktop; follow it when we are allowed to (service helper).
         #[cfg(windows)]
         super::desktop_switch::follow_input_desktop();
         #[cfg(windows)]
-        match super::dxgi::Dxgi::new() {
-            Ok(d) => return Ok(Source::Dxgi(d)),
+        match super::dxgi::Dxgi::new(monitor) {
+            Ok((d, _)) => return Ok(Source::Dxgi(d)),
             Err(e) => tracing::warn!("DXGI capture unavailable, falling back to GDI: {e:#}"),
         }
+        let _ = monitor;
         let monitors = Monitor::all().context("list monitors")?;
         let primary = monitors.iter().position(|m| m.is_primary().unwrap_or(false)).unwrap_or(0);
         let monitor = monitors.into_iter().nth(primary).context("no monitors found")?;
@@ -152,10 +205,11 @@ impl Source {
 fn capture_loop(
     conn: &Connection,
     profile: Profile,
+    monitor: Option<usize>,
     control: &Control,
     start_tx: &mut Option<oneshot::Sender<Result<StreamStart>>>,
 ) -> Result<Exit> {
-    let mut source = Source::open()?;
+    let mut source = Source::open(monitor)?;
     let (sw, sh) = source.size();
     tracing::info!(source = source.kind(), width = sw, height = sh, desktop = %current_desktop(), "capture source opened");
     let scale = sw.div_ceil(MAX_WIDTH).max(1);
@@ -168,7 +222,9 @@ fn capture_loop(
     let mut encoder = encoder::create(w, h, fps, bitrate, true)?;
     tracing::info!(encoder = %encoder.name(), "encoder ready");
     if let Some(tx) = start_tx.take() {
-        let _ = tx.send(Ok(StreamStart { geometry, encoder: encoder.name() }));
+        let (monitors, chosen, place) = monitor_labels(monitor);
+        let place = if source.kind() == "dxgi" { place } else { None };
+        let _ = tx.send(Ok(StreamStart { geometry, encoder: encoder.name(), monitors, monitor: chosen, place }));
     }
 
     let interval = Duration::from_secs_f64(1.0 / fps as f64);
@@ -204,7 +260,7 @@ fn capture_loop(
                 if !on_input_desktop() {
                     return Ok(Exit::DesktopChanged);
                 }
-                match Source::open() {
+                match Source::open(monitor) {
                     Ok(s) if s.size() == (sw, sh) => {
                         source = s;
                         control.keyframe.store(true, Ordering::Relaxed);

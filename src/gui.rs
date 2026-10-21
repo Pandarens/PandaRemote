@@ -76,6 +76,7 @@ struct PinPrompt {
     name: String,
     ticket: String,
     profile: Profile,
+    monitor: Option<u8>,
     pin: String,
     error: Option<String>,
 }
@@ -159,6 +160,11 @@ struct ThisPc {
 struct DesktopView {
     name: String,
     ticket: String,
+    /// What this session connected with, to connect again on another monitor.
+    pin: Option<String>,
+    monitor: Option<u8>,
+    /// Set by the toolbar: reconnect to this monitor.
+    switch_monitor: Option<u8>,
     profile: Profile,
     shared: Arc<viewer::Shared>,
     out: tmpsc::UnboundedSender<ClientMsg>,
@@ -303,7 +309,7 @@ impl App {
             app.start_host();
         }
         if let Some((t, profile)) = initial {
-            app.start_session("Удалённый ПК".into(), t.encode(), profile, None);
+            app.start_session("Удалённый ПК".into(), t.encode(), profile, None, None);
         }
         app
     }
@@ -432,8 +438,8 @@ impl App {
                         if d.fullscreen {
                             self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                         }
-                        let (name, ticket, profile) = (d.name, d.ticket, d.profile);
-                        self.pin_prompt = Some(PinPrompt { name, ticket, profile, pin: String::new(), error });
+                        let (name, ticket, profile, monitor) = (d.name, d.ticket, d.profile, d.monitor);
+                        self.pin_prompt = Some(PinPrompt { name, ticket, profile, monitor, pin: String::new(), error });
                     }
                 }
                 UiEvent::Connected { ticket } => {
@@ -459,7 +465,14 @@ impl App {
 
     // ---------- actions ----------
 
-    fn start_session(&mut self, name: String, ticket_str: String, profile: Profile, pin: Option<String>) {
+    fn start_session(
+        &mut self,
+        name: String,
+        ticket_str: String,
+        profile: Profile,
+        pin: Option<String>,
+        monitor: Option<u8>,
+    ) {
         let ticket = match Ticket::decode(&ticket_str) {
             Ok(t) => t,
             Err(e) => {
@@ -473,10 +486,10 @@ impl App {
         let send = self.send_event();
         let ctx = self.ctx.clone();
         let repaint: viewer::Repaint = Arc::new(move || ctx.request_repaint());
-        let (shared2, out_tx2, ticket_str2) = (shared.clone(), out_tx.clone(), ticket_str.clone());
+        let (shared2, out_tx2, ticket_str2, pin2) = (shared.clone(), out_tx.clone(), ticket_str.clone(), pin.clone());
         let task = self.rt.spawn(async move {
             let res = async {
-                let session = client::connect(&ticket, profile, pin.as_deref()).await?;
+                let session = client::connect(&ticket, profile, pin2.as_deref(), monitor).await?;
                 send(UiEvent::Connected { ticket: ticket_str2 });
                 viewer::run(session, shared2, out_tx2, out_rx, repaint, true).await
             }
@@ -495,6 +508,9 @@ impl App {
         self.desktop = Some(DesktopView {
             name,
             ticket: ticket_str,
+            pin,
+            monitor,
+            switch_monitor: None,
             profile,
             shared,
             out: out_tx,
@@ -679,8 +695,8 @@ impl App {
         if let Some((i, what)) = action {
             let h = self.hosts[i].clone();
             match what {
-                "desktop" => self.start_session(h.name, h.ticket, Profile::Desktop, None),
-                "game" => self.start_session(h.name, h.ticket, Profile::Game, None),
+                "desktop" => self.start_session(h.name, h.ticket, Profile::Desktop, None, None),
+                "game" => self.start_session(h.name, h.ticket, Profile::Game, None, None),
                 "rename" => self.renaming = Some((i, h.name)),
                 "rename_done" => {
                     if let Some((_, name)) = self.renaming.take()
@@ -1197,7 +1213,7 @@ impl App {
             self.pin_prompt = None;
         } else if submit && !p.pin.is_empty() {
             let p = self.pin_prompt.take().unwrap();
-            self.start_session(p.name, p.ticket, p.profile, Some(p.pin));
+            self.start_session(p.name, p.ticket, p.profile, Some(p.pin), p.monitor);
         }
     }
 
@@ -1228,10 +1244,11 @@ impl App {
                             (Tool::Control, Icon::Cursor, "Управление удалённым ПК"),
                             (Tool::Pen, Icon::Pen, "Перо: линии видны на удалённом экране и исчезают через секунду"),
                             (Tool::Laser, Icon::Laser, "Указка: красная точка на удалённом экране"),
+                            (Tool::View, Icon::Eye, "Только просмотр: экран виден, мышь, клавиатура и геймпад не передаются"),
                         ] {
                             let kind = if view.tool == tool { Kind::Active } else { Kind::Ghost };
                             if button_sized(ui, Some(ic), "", kind, 26.0).on_hover_text(tip).clicked() {
-                                view.tool = tool;
+                                set_tool(view, tool, ui.ctx());
                             }
                         }
                     });
@@ -1251,7 +1268,7 @@ impl App {
                     }
                     ui.spacing_mut().item_spacing.x = 8.0;
                 }
-                if view.tool != Tool::Control
+                if matches!(view.tool, Tool::Pen | Tool::Laser)
                     && button_sized(ui, Some(Icon::Eraser), "", Kind::Ghost, 28.0).on_hover_text("Стереть всё").clicked()
                 {
                     view.ink.apply(&DrawEvent::Clear, Instant::now());
@@ -1268,6 +1285,31 @@ impl App {
                     {
                         view.fullscreen = true;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    }
+                    let (monitors, current) = view.shared.monitors.lock().unwrap().clone();
+                    if monitors.len() > 1 {
+                        let label = format!("{}", current + 1);
+                        let menu = button_sized(ui, Some(Icon::Monitor), &label, Kind::Ghost, 28.0)
+                            .on_hover_text("Какой монитор показывать");
+                        egui::Popup::menu(&menu).show(|ui| {
+                            ui.set_min_width(220.0);
+                            for (i, name) in monitors.iter().enumerate() {
+                                let icon = if i == current as usize { Icon::Check } else { Icon::Monitor };
+                                if menu_item(ui, icon, name, false).clicked() {
+                                    if i != current as usize {
+                                        view.switch_monitor = Some(i as u8);
+                                    }
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                    if view.tool != Tool::View
+                        && button_sized(ui, None, "Ctrl+Alt+Del", Kind::Ghost, 28.0)
+                            .on_hover_text("Нажать Ctrl+Alt+Del на удалённом ПК (нужна служба Windows на нём)")
+                            .clicked()
+                    {
+                        let _ = view.out.send(ClientMsg::SecureAttention);
                     }
                     if view.shared.secure_desktop.load(Ordering::Relaxed) {
                         chip(ui, Icon::Lock, "Экран блокировки", YELLOW, YELLOW_TILE).on_hover_text(
@@ -1330,8 +1372,10 @@ impl App {
             let resp = ui.allocate_rect(rect, Sense::click_and_drag());
             let (events, mods, focused) = ui.input(|i| (i.events.clone(), i.modifiers, i.focused));
 
-            // Drawing tools: the pointer draws instead of controlling the remote mouse.
-            if view.tool != Tool::Control && view.game.as_ref().is_none_or(|g| !g.captured) {
+            if view.tool == Tool::View {
+                // View only: the pointer and keys stay here.
+            } else if view.tool != Tool::Control && view.game.as_ref().is_none_or(|g| !g.captured) {
+                // Drawing tools: the pointer draws instead of controlling the remote mouse.
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                 draw_input(view, &events, rect);
             } else {
@@ -1368,6 +1412,19 @@ impl App {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             }
             d.task.abort();
+        } else if let Some(monitor) = self.desktop.as_ref().and_then(|d| d.switch_monitor)
+            && let Some(mut d) = self.desktop.take()
+        {
+            // Another monitor means another resolution: connect again (with the same PIN, if any).
+            if let Some(g) = d.game.as_mut() {
+                release_capture(g, &d.out, ui.ctx());
+            }
+            d.task.abort();
+            let fullscreen = d.fullscreen;
+            self.start_session(d.name, d.ticket, d.profile, d.pin, Some(monitor));
+            if let Some(v) = self.desktop.as_mut() {
+                v.fullscreen = fullscreen;
+            }
         }
     }
 }
@@ -1750,6 +1807,27 @@ enum Tool {
     Control,
     Pen,
     Laser,
+    /// Watch only: nothing is sent to the remote PC.
+    View,
+}
+
+/// Switches the session tool; entering view-only first lets go of everything held on the remote PC.
+fn set_tool(view: &mut DesktopView, tool: Tool, ctx: &egui::Context) {
+    if tool == Tool::View && view.tool != Tool::View {
+        let send = |ev: InputEvent| {
+            let _ = view.out.send(ClientMsg::Input(ev));
+        };
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            send(InputEvent::MouseButton { button, down: false });
+        }
+        view.secure_keys.release_all(&send);
+        if let Some(g) = view.game.as_mut() {
+            release_capture(g, &view.out, ctx);
+        }
+        let _ = view.out.send(ClientMsg::Gamepad(Default::default()));
+    }
+    view.tool = tool;
+    view.shared.view_only.store(tool == Tool::View, Ordering::Relaxed);
 }
 
 fn norm_in(p: Pos2, rect: Rect) -> Option<(u16, u16)> {

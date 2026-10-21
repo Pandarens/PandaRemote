@@ -5,12 +5,13 @@ use std::{collections::HashSet, sync::mpsc};
 
 use crate::proto::{InputEvent, KeyCode, Modifiers, MouseButton};
 
-pub fn spawn() -> mpsc::Sender<InputEvent> {
+/// `place`: the streamed monitor when it isn't the primary one (mouse positions are relative to it).
+pub fn spawn(place: Option<super::capture::Place>) -> mpsc::Sender<InputEvent> {
     let (tx, rx) = mpsc::channel::<InputEvent>();
     std::thread::Builder::new()
         .name("input".into())
         .spawn(move || {
-            let mut injector = Injector::default();
+            let mut injector = Injector { place, ..Default::default() };
             for ev in rx {
                 injector.apply(ev);
             }
@@ -25,6 +26,7 @@ pub fn spawn() -> mpsc::Sender<InputEvent> {
 struct Injector {
     keys: HashSet<(u16, bool)>,
     buttons: HashSet<u8>,
+    place: Option<super::capture::Place>,
     #[cfg(windows)]
     desktop: Desktop,
 }
@@ -96,10 +98,15 @@ impl Injector {
         use windows::Win32::UI::Input::KeyboardAndMouse::*;
         self.desktop.0.check();
         match ev {
-            InputEvent::MouseMove { x, y } => {
+            InputEvent::MouseMove { x, y } => match self.place {
                 // 0..65535 over the primary monitor is exactly MOUSEEVENTF_ABSOLUTE's coordinate space.
-                win::mouse(x as i32, y as i32, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE);
-            }
+                None => win::mouse(x as i32, y as i32, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE),
+                // Another monitor: map onto it, in 0..65535 over the whole virtual desktop.
+                Some(p) => {
+                    let (vx, vy) = virtual_desktop_point(p, x, y);
+                    win::mouse(vx, vy, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
+                }
+            },
             InputEvent::MouseRelative { dx, dy } => {
                 win::mouse(dx, dy, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE);
             }
@@ -229,6 +236,27 @@ fn modifier_vks(mods: Modifiers) -> Vec<u16> {
 }
 
 /// Makes absolute coordinates and capture use physical pixels.
+/// Normalized (0..=65535) position on monitor `p` -> MOUSEEVENTF_VIRTUALDESK coordinates.
+#[cfg(windows)]
+fn virtual_desktop_point(p: super::capture::Place, x: u16, y: u16) -> (i32, i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+    let (vl, vt, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
+        )
+    };
+    let px = p.left as f64 + x as f64 / 65535.0 * (p.width.saturating_sub(1)) as f64;
+    let py = p.top as f64 + y as f64 / 65535.0 * (p.height.saturating_sub(1)) as f64;
+    let nx = (px - vl as f64) * 65535.0 / (vw - 1).max(1) as f64;
+    let ny = (py - vt as f64) * 65535.0 / (vh - 1).max(1) as f64;
+    (nx.round() as i32, ny.round() as i32)
+}
+
 pub fn set_dpi_aware() {
     #[cfg(windows)]
     unsafe {

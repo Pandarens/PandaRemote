@@ -17,7 +17,13 @@ use super::{
 };
 use crate::proto::{self, ClientMsg, HostMsg, Profile};
 
-pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
+pub async fn serve(
+    conn: &Connection,
+    profile: Profile,
+    monitor: Option<u8>,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> Result<()> {
     let (start_bitrate, min_bitrate, max_bitrate) = profile.bitrate();
     let control = Arc::new(Control::default());
     control.bitrate.store(start_bitrate, Ordering::Relaxed);
@@ -27,7 +33,7 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
         let (conn, control) = (conn.clone(), control.clone());
         std::thread::Builder::new()
             .name("capture".into())
-            .spawn(move || capture::run(conn, profile, control, start_tx))?;
+            .spawn(move || capture::run(conn, profile, monitor.map(usize::from), control, start_tx))?;
     }
     let start = start_rx.await??;
     tracing::info!(encoder = %start.encoder, profile = profile.name(), "stream started");
@@ -58,10 +64,12 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
         encoder: start.encoder,
         audio,
         gamepad_error,
+        monitors: start.monitors,
+        monitor: start.monitor,
     };
     proto::write_msg(&mut send, &info).await?;
 
-    let input_tx = input::spawn();
+    let input_tx = input::spawn(start.place);
     let mut abr = Abr { current: start_bitrate, min: min_bitrate, max: max_bitrate, clean_seconds: 0 };
 
     // Created on the first drawing event, so sessions that never draw don't put a window on screen.
@@ -87,6 +95,13 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
                     let _ = ev;
                 }
                 ClientMsg::RequestKeyframe => control.keyframe.store(true, Ordering::Relaxed),
+                ClientMsg::SecureAttention =>
+                {
+                    #[cfg(windows)]
+                    if let Err(e) = crate::service::request_sas() {
+                        tracing::warn!("Ctrl+Alt+Del: {e:#}");
+                    }
+                }
                 ClientMsg::Stats { frames, lost } => {
                     if let Some(bps) = abr.update(frames, lost) {
                         tracing::debug!(bps, frames, lost, "bitrate changed");
