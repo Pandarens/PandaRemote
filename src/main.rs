@@ -159,6 +159,7 @@ fn main() -> Result<()> {
                 Ok(route) => println!("В сети: {route}"),
                 Err(e) => println!("Не в сети: {e:#}"),
             }
+            client::shutdown().await;
             Ok(())
         }),
         Some(Command::Log) => {
@@ -280,6 +281,7 @@ fn main() -> Result<()> {
             }
             let run = client::viewer::run(session, shared.clone(), tx, rx, repaint, false);
             let _ = tokio::time::timeout(std::time::Duration::from_secs(seconds), run).await;
+            client::shutdown().await;
             let frame = shared.frame.lock().unwrap().take();
             if frame.is_none() {
                 println!("Статус без кадров: {}", shared.status.lock().unwrap());

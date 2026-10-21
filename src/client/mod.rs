@@ -59,6 +59,14 @@ pub async fn connect(ticket: &Ticket, profile: Profile) -> Result<Session> {
     Ok(Session { conn, send, recv, host_name })
 }
 
+/// Closes the process-wide endpoint gracefully, so hosts see the disconnect at once instead of after
+/// an idle timeout. Call before a short-lived command exits.
+pub async fn shutdown() {
+    if let Some(ep) = ENDPOINT.get() {
+        ep.close().await;
+    }
+}
+
 /// Checks whether a host is online; returns its route (P2P/relay, RTT) when it answered.
 pub async fn ping(host_id: iroh::EndpointId) -> Result<String> {
     let ep = endpoint().await?;
