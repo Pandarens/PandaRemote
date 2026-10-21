@@ -45,6 +45,8 @@ pub struct Shared {
     /// Problem worth showing next to the status (e.g. no virtual gamepad on the host).
     pub notice: Mutex<Option<String>>,
     pub decoder: Mutex<String>,
+    /// The host is on its lock screen / a UAC prompt.
+    pub secure_desktop: AtomicBool,
     /// Where host vibration requests go (set by the GUI in the game profile).
     pub rumble: Mutex<Option<super::gamepad::RumbleSender>>,
     pub decoded: AtomicU32,
@@ -116,10 +118,17 @@ pub async fn run(
     };
     let host_messages = async {
         loop {
-            if let HostMsg::Rumble { large, small } = proto::read_msg::<HostMsg>(&mut recv).await? {
-                if let Some(tx) = shared.rumble.lock().unwrap().as_ref() {
-                    let _ = tx.send((large, small));
+            match proto::read_msg::<HostMsg>(&mut recv).await? {
+                HostMsg::Rumble { large, small } => {
+                    if let Some(tx) = shared.rumble.lock().unwrap().as_ref() {
+                        let _ = tx.send((large, small));
+                    }
                 }
+                HostMsg::SecureDesktop(on) => {
+                    shared.secure_desktop.store(on, Ordering::Relaxed);
+                    repaint();
+                }
+                _ => {}
             }
         }
         #[allow(unreachable_code)]

@@ -89,6 +89,8 @@ pub enum HostMsg {
         large: u8,
         small: u8,
     },
+    /// The host shows the lock screen / a UAC prompt (a secure desktop) or is back on the normal desktop.
+    SecureDesktop(bool),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

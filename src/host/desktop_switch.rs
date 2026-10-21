@@ -18,6 +18,17 @@ use windows::Win32::{
     },
 };
 
+/// Name of the desktop that currently receives input (`Default`, `Winlogon`, ...); `None` when this
+/// process may not open it (a normal user process while the lock screen is up).
+pub fn input_desktop_name() -> Option<String> {
+    unsafe {
+        let desk = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(GENERIC_ALL.0)).ok()?;
+        let name = desktop_name(desk);
+        let _ = CloseDesktop(desk);
+        name
+    }
+}
+
 /// Moves the calling thread to the input desktop if it changed. Returns true on a switch.
 pub fn follow_input_desktop() -> bool {
     unsafe {

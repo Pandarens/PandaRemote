@@ -4,7 +4,7 @@
 mod audio;
 mod capture;
 #[cfg(windows)]
-mod desktop_switch;
+pub mod desktop_switch;
 #[cfg(windows)]
 mod dxgi;
 pub mod encoder;

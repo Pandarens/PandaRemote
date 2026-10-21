@@ -42,8 +42,12 @@ pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>) -> Result<()> {
 enum UiEvent {
     HostStarted(Result<Host>),
     HostOnline,
-    Connected { ticket: String },
+    Connected {
+        ticket: String,
+    },
     DesktopEnded(Option<String>),
+    /// Elevated service install/uninstall finished: (installing, result).
+    ServiceDone(bool, Result<(), String>),
 }
 
 #[derive(PartialEq)]
@@ -78,6 +82,8 @@ struct ThisPc {
     confirm_rotate: bool,
     journal: Vec<JournalEntry>,
     journal_at: Option<Instant>,
+    /// An elevated install/uninstall is running.
+    service_busy: bool,
 }
 
 struct DesktopView {
@@ -94,15 +100,62 @@ struct DesktopView {
     fullscreen: bool,
     /// Present in the game profile.
     game: Option<GameInput>,
+    /// Physical-key keyboard used while the host shows its lock screen.
+    secure_keys: ScancodeKeyboard,
 }
 
 /// Game-profile input: captured pointer, raw mouse deltas, keys as scancodes, gamepad forwarding.
 struct GameInput {
     captured: bool,
-    mods: egui::Modifiers,
-    pressed: HashSet<(u16, bool)>,
+    keys: ScancodeKeyboard,
     motion: Vec2,
     pad_stop: Arc<AtomicBool>,
+}
+
+/// Keyboard forwarded as physical keys (scancodes): in the game profile, and while the host shows its
+/// lock screen, where a typed password must arrive as real key presses in the lock screen's layout.
+#[derive(Default)]
+struct ScancodeKeyboard {
+    mods: egui::Modifiers,
+    pressed: HashSet<(u16, bool)>,
+}
+
+impl ScancodeKeyboard {
+    /// egui reports modifiers as state, not key events: diff them into scancodes.
+    fn sync_modifiers(&mut self, now: egui::Modifiers, send: &impl Fn(InputEvent)) {
+        for (was, is, code) in [
+            (self.mods.ctrl, now.ctrl, SC_LCTRL),
+            (self.mods.shift, now.shift, SC_LSHIFT),
+            (self.mods.alt, now.alt, SC_LALT),
+        ] {
+            if was != is {
+                self.set((code, false), is, send);
+            }
+        }
+        self.mods = now;
+    }
+
+    fn key(&mut self, key: egui::Key, pressed: bool, send: &impl Fn(InputEvent)) {
+        if let Some(code) = scancode(key) {
+            self.set(code, pressed, send);
+        }
+    }
+
+    fn set(&mut self, (code, extended): (u16, bool), down: bool, send: &impl Fn(InputEvent)) {
+        if down {
+            self.pressed.insert((code, extended));
+        } else {
+            self.pressed.remove(&(code, extended));
+        }
+        send(InputEvent::Scancode { code, extended, down });
+    }
+
+    fn release_all(&mut self, send: &impl Fn(InputEvent)) {
+        for (code, extended) in self.pressed.drain() {
+            send(InputEvent::Scancode { code, extended, down: false });
+        }
+        self.mods = egui::Modifiers::default();
+    }
 }
 
 impl Drop for GameInput {
@@ -130,6 +183,7 @@ impl App {
                 online: false,
                 show_ticket: false,
                 confirm_rotate: false,
+                service_busy: false,
                 journal: Vec::new(),
                 journal_at: None,
             },
@@ -162,6 +216,16 @@ impl App {
                     self.message = Some((true, format!("Не удалось запустить хост: {e:#}")));
                 }
                 UiEvent::HostOnline => self.this_pc.online = true,
+                UiEvent::ServiceDone(installing, result) => {
+                    self.this_pc.service_busy = false;
+                    self.message = Some(match (installing, result) {
+                        (true, Ok(())) => {
+                            (false, "Служба установлена: ПК доступен на экране блокировки и до входа в систему.".into())
+                        }
+                        (false, Ok(())) => (false, "Служба удалена.".into()),
+                        (_, Err(e)) => (true, format!("Служба: {e}")),
+                    });
+                }
                 UiEvent::Connected { ticket } => {
                     if let Some(h) = self.hosts.iter_mut().find(|h| h.ticket == ticket) {
                         h.last_connected = Some(config::now_rfc3339());
@@ -212,13 +276,7 @@ impl App {
         let game = (profile == Profile::Game).then(|| {
             let pad_stop = Arc::new(AtomicBool::new(false));
             *shared.rumble.lock().unwrap() = Some(gamepad::spawn(out_tx.clone(), pad_stop.clone()));
-            GameInput {
-                captured: false,
-                mods: egui::Modifiers::default(),
-                pressed: HashSet::new(),
-                motion: Vec2::ZERO,
-                pad_stop,
-            }
+            GameInput { captured: false, keys: ScancodeKeyboard::default(), motion: Vec2::ZERO, pad_stop }
         });
         self.message = None;
         self.desktop = Some(DesktopView {
@@ -234,6 +292,7 @@ impl App {
             wheel: Vec2::ZERO,
             fullscreen: false,
             game,
+            secure_keys: ScancodeKeyboard::default(),
         });
     }
 
@@ -379,13 +438,30 @@ impl App {
                 ui.label("Билет и журнал службы доступны администраторам: panda-rc ticket / panda-rc log в терминале администратора.");
             }
         }
-        ui.label(
-            egui::RichText::new(
-                "Управление службой — из терминала администратора: panda-rc service uninstall / install",
-            )
-            .weak(),
-        );
+        ui.add_space(6.0);
+        if ui.add_enabled(!self.this_pc.service_busy, egui::Button::new("Удалить службу…")).clicked() {
+            self.service_action(false);
+        }
         ui.ctx().request_repaint_after(Duration::from_secs(2));
+    }
+
+    /// Installs or removes the service with a UAC prompt, off the UI thread.
+    fn service_action(&mut self, install: bool) {
+        #[cfg(windows)]
+        {
+            if install {
+                // The service takes over this PC's key; the in-app host must not compete with it.
+                self.stop_host();
+            }
+            self.this_pc.service_busy = true;
+            let send = self.send_event();
+            std::thread::spawn(move || {
+                let result = crate::service::run_elevated(if install { "install" } else { "uninstall" });
+                send(UiEvent::ServiceDone(install, result.map_err(|e| format!("{e:#}"))));
+            });
+        }
+        #[cfg(not(windows))]
+        let _ = install;
     }
 
     fn this_pc_tab(&mut self, ui: &mut egui::Ui) {
@@ -465,6 +541,21 @@ impl App {
                     }
                 });
             }
+
+            #[cfg(windows)]
+            {
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("🔒 Доступ всегда").strong());
+                ui.label("Служба Windows: ПК доступен на экране блокировки, в окнах UAC и после перезагрузки до входа в систему.");
+                let label = if self.this_pc.service_busy {
+                    "Установка…"
+                } else {
+                    "Установить службу…"
+                };
+                if ui.add_enabled(!self.this_pc.service_busy, egui::Button::new(label)).clicked() {
+                    self.service_action(true);
+                }
+            }
         }
 
         ui.add_space(12.0);
@@ -515,6 +606,12 @@ impl App {
                             "кликните по картинке, чтобы захватить мышь"
                         };
                         ui.label(egui::RichText::new(hint).weak());
+                    }
+                    if view.shared.secure_desktop.load(Ordering::Relaxed) {
+                        ui.colored_label(
+                            Color32::from_rgb(120, 170, 255),
+                            "🔒 удалённый ПК на экране блокировки — клавиши передаются как физические",
+                        );
                     }
                     if let Some(notice) = view.shared.notice.lock().unwrap().as_deref() {
                         ui.colored_label(Color32::from_rgb(230, 170, 60), format!("🎮 геймпад: {notice}"));
@@ -567,7 +664,7 @@ impl App {
             if let Some(g) = view.game.as_mut() {
                 if !g.captured && resp.clicked() {
                     g.captured = true;
-                    g.mods = egui::Modifiers::default();
+                    g.keys.mods = egui::Modifiers::default();
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
                     return;
@@ -581,11 +678,32 @@ impl App {
                     return;
                 }
             }
+            let secure = view.shared.secure_desktop.load(Ordering::Relaxed);
+            let out = &view.out;
+            let send = |ev: InputEvent| {
+                let _ = out.send(ClientMsg::Input(ev));
+            };
+            if secure {
+                view.secure_keys.sync_modifiers(mods, &send);
+            } else if !view.secure_keys.pressed.is_empty() {
+                view.secure_keys.release_all(&send);
+            }
             for ev in events {
                 if let egui::Event::Key { key: egui::Key::F11, pressed: true, .. } = ev {
                     view.fullscreen ^= true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(view.fullscreen));
                     continue;
+                }
+                // Lock screen: keys go as physical presses; text and clipboard events would not register there.
+                if secure {
+                    match &ev {
+                        egui::Event::Key { key, physical_key, pressed, .. } => {
+                            view.secure_keys.key(physical_key.unwrap_or(*key), *pressed, &send);
+                            continue;
+                        }
+                        egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut => continue,
+                        _ => {}
+                    }
                 }
                 for msg in translate(&ev, rect, &mut view.last_pos, &mut view.wheel) {
                     let _ = view.out.send(ClientMsg::Input(msg));
@@ -659,20 +777,7 @@ fn game_input(
     let send = |ev: InputEvent| {
         let _ = out.send(ClientMsg::Input(ev));
     };
-    // egui reports modifiers as state, not key events: diff them into scancodes.
-    for (was, now, code) in
-        [(g.mods.ctrl, mods.ctrl, SC_LCTRL), (g.mods.shift, mods.shift, SC_LSHIFT), (g.mods.alt, mods.alt, SC_LALT)]
-    {
-        if was != now {
-            if now {
-                g.pressed.insert((code, false));
-            } else {
-                g.pressed.remove(&(code, false));
-            }
-            send(InputEvent::Scancode { code, extended: false, down: now });
-        }
-    }
-    g.mods = mods;
+    g.keys.sync_modifiers(mods, &send);
 
     for ev in events {
         match ev {
@@ -688,14 +793,7 @@ fn game_input(
                     }
                     continue;
                 }
-                if let Some((code, extended)) = scancode(key) {
-                    if *pressed {
-                        g.pressed.insert((code, extended));
-                    } else {
-                        g.pressed.remove(&(code, extended));
-                    }
-                    send(InputEvent::Scancode { code, extended, down: *pressed });
-                }
+                g.keys.key(key, *pressed, &send);
             }
             // egui turns Ctrl+C/X/V into clipboard events; Ctrl is already down on the host.
             egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => {
@@ -736,11 +834,10 @@ fn game_input(
 }
 
 fn release_capture(g: &mut GameInput, out: &tmpsc::UnboundedSender<ClientMsg>, ctx: &egui::Context) {
-    for (code, extended) in g.pressed.drain() {
-        let _ = out.send(ClientMsg::Input(InputEvent::Scancode { code, extended, down: false }));
-    }
+    g.keys.release_all(&|ev| {
+        let _ = out.send(ClientMsg::Input(ev));
+    });
     g.captured = false;
-    g.mods = egui::Modifiers::default();
     ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
     ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
 }

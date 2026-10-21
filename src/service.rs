@@ -122,6 +122,67 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Finishes an install/uninstall: prints on success, and mirrors the outcome into `result_file`
+/// for [`run_elevated`] (the elevated process has no console the GUI could read).
+pub fn report(result_file: Option<std::path::PathBuf>, result: Result<()>, on_ok: impl FnOnce()) -> Result<()> {
+    if let Some(path) = result_file {
+        let text = match &result {
+            Ok(()) => "ok".to_string(),
+            Err(e) => format!("{e:#}"),
+        };
+        let _ = std::fs::write(path, text);
+    }
+    result.map(|()| on_ok())
+}
+
+/// Runs `panda-rc service <action>` with administrator rights (UAC prompt) and waits for it.
+pub fn run_elevated(action: &str) -> Result<()> {
+    use windows::Win32::{
+        Foundation::{ERROR_CANCELLED, WAIT_FAILED},
+        System::Threading::{GetExitCodeProcess, INFINITE},
+        UI::{
+            Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
+            WindowsAndMessaging::SW_HIDE,
+        },
+    };
+    let result_file = std::env::temp_dir().join(format!("panda-service-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&result_file);
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let exe = wide(&std::env::current_exe()?.to_string_lossy());
+    let params = wide(&format!("service {action} --result-file \"{}\"", result_file.display()));
+    let verb = wide("runas");
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(exe.as_ptr()),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    unsafe {
+        if let Err(e) = ShellExecuteExW(&mut info) {
+            if e.code() == ERROR_CANCELLED.to_hresult() {
+                bail!("отменено в окне контроля учётных записей");
+            }
+            return Err(e).context("не удалось запустить с правами администратора");
+        }
+        if WaitForSingleObject(info.hProcess, INFINITE) == WAIT_FAILED {
+            bail!("ожидание процесса установки не удалось");
+        }
+        let mut code = 0u32;
+        let _ = GetExitCodeProcess(info.hProcess, &mut code);
+        let _ = CloseHandle(info.hProcess);
+        let text = std::fs::read_to_string(&result_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&result_file);
+        match text.as_str() {
+            "ok" => Ok(()),
+            "" => bail!("процесс завершился с кодом {code} без отчёта"),
+            err => bail!("{err}"),
+        }
+    }
+}
+
 /// Service state for the GUI/CLI; `None` when not installed or not queryable.
 pub fn status() -> Option<ServiceState> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;

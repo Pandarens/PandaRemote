@@ -85,16 +85,33 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
             }
         }
     };
-    let forward_rumble = async {
-        while let Some((large, small)) = rumble_rx.recv().await {
-            proto::write_msg(&mut send, &HostMsg::Rumble { large, small }).await?;
+    // Host -> viewer notifications: vibration, and whether the lock screen / UAC is showing
+    // (the viewer then sends physical keys, so a password typed remotely lands in the lock screen's layout).
+    let notify = async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        let (mut secure, mut rumble_open) = (false, true);
+        loop {
+            tokio::select! {
+                r = rumble_rx.recv(), if rumble_open => match r {
+                    Some((large, small)) => proto::write_msg(&mut send, &HostMsg::Rumble { large, small }).await?,
+                    None => rumble_open = false,
+                },
+                _ = tick.tick() => {
+                    let now = on_secure_desktop();
+                    if now != secure {
+                        secure = now;
+                        tracing::info!(secure, "input desktop changed");
+                        proto::write_msg(&mut send, &HostMsg::SecureDesktop(secure)).await?;
+                    }
+                }
+            }
         }
-        // No virtual pad (or it went away): nothing more to forward, but the session goes on.
-        std::future::pending::<Result<()>>().await
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
     };
     let result: Result<()> = tokio::select! {
         r = control_loop => r,
-        r = forward_rumble => r,
+        r = notify => r,
         _ = conn.closed() => Ok(()),
     };
     control.stop.store(true, Ordering::Relaxed);
@@ -104,6 +121,13 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
         Err(e) if is_closed(&e) => Ok(()),
         other => other,
     }
+}
+
+fn on_secure_desktop() -> bool {
+    #[cfg(windows)]
+    return super::desktop_switch::input_desktop_name().is_some_and(|n| !n.eq_ignore_ascii_case("Default"));
+    #[cfg(not(windows))]
+    false
 }
 
 /// Adaptive bitrate: back off on loss, probe upwards after a clean stretch.

@@ -79,9 +79,16 @@ enum Command {
 #[derive(Subcommand)]
 enum ServiceAction {
     /// Установить и запустить службу (от имени администратора)
-    Install,
+    Install {
+        /// Куда записать результат (используется кнопкой в GUI)
+        #[arg(long, hide = true)]
+        result_file: Option<std::path::PathBuf>,
+    },
     /// Остановить и удалить службу (от имени администратора)
-    Uninstall,
+    Uninstall {
+        #[arg(long, hide = true)]
+        result_file: Option<std::path::PathBuf>,
+    },
     /// Показать состояние службы
     Status,
     /// Точка входа службы (запускается Windows)
@@ -156,15 +163,11 @@ fn main() -> Result<()> {
         }
         #[cfg(windows)]
         Some(Command::Service { action }) => match action {
-            ServiceAction::Install => {
-                service::install()?;
-                println!("Служба установлена и запущена. Билет прежний: panda-rc ticket");
-                Ok(())
-            }
-            ServiceAction::Uninstall => {
-                service::uninstall()?;
-                println!("Служба удалена.");
-                Ok(())
+            ServiceAction::Install { result_file } => service::report(result_file, service::install(), || {
+                println!("Служба установлена и запущена. Билет прежний: panda-rc ticket")
+            }),
+            ServiceAction::Uninstall { result_file } => {
+                service::report(result_file, service::uninstall(), || println!("Служба удалена."))
             }
             ServiceAction::Status => {
                 match service::status() {
