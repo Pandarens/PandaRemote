@@ -213,7 +213,7 @@ impl App {
         });
         let game = (profile == Profile::Game).then(|| {
             let pad_stop = Arc::new(AtomicBool::new(false));
-            gamepad::spawn(out_tx.clone(), pad_stop.clone());
+            *shared.rumble.lock().unwrap() = Some(gamepad::spawn(out_tx.clone(), pad_stop.clone()));
             GameInput { captured: false, mods: egui::Modifiers::default(), pressed: HashSet::new(), motion: Vec2::ZERO, pad_stop }
         });
         self.message = None;

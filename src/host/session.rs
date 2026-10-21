@@ -31,8 +31,9 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
     }
     let start = start_rx.await??;
     tracing::info!(encoder = %start.encoder, profile = profile.name(), "stream started");
+    let (rumble_tx, mut rumble_rx) = tokio::sync::mpsc::unbounded_channel();
     let (pad_tx, gamepad_error) = match profile {
-        Profile::Game => match gamepad::spawn() {
+        Profile::Game => match gamepad::spawn(rumble_tx) {
             Ok(tx) => (Some(tx), None),
             Err(e) => {
                 tracing::warn!("virtual gamepad unavailable: {e:#}");
@@ -84,8 +85,16 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
             }
         }
     };
+    let forward_rumble = async {
+        while let Some((large, small)) = rumble_rx.recv().await {
+            proto::write_msg(&mut send, &HostMsg::Rumble { large, small }).await?;
+        }
+        // No virtual pad (or it went away): nothing more to forward, but the session goes on.
+        std::future::pending::<Result<()>>().await
+    };
     let result: Result<()> = tokio::select! {
         r = control_loop => r,
+        r = forward_rumble => r,
         _ = conn.closed() => Ok(()),
     };
     control.stop.store(true, Ordering::Relaxed);

@@ -8,13 +8,21 @@ use std::{
     time::Duration,
 };
 
-use gilrs::{Axis, Button, Gamepad, Gilrs};
+use gilrs::{
+    Axis, Button, Gamepad, GamepadId, Gilrs,
+    ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Replay, Ticks},
+};
 use tokio::sync::mpsc;
 
 use crate::proto::{ClientMsg, GamepadState, buttons};
 
-/// Polls controllers until `stop` is set; sends a message whenever the state changes.
-pub fn spawn(out: mpsc::UnboundedSender<ClientMsg>, stop: Arc<AtomicBool>) {
+/// Vibration requests from the host: (large motor, small motor), 0..=255.
+pub type RumbleSender = std::sync::mpsc::Sender<(u8, u8)>;
+
+/// Polls controllers until `stop` is set; sends a message whenever the state changes
+/// and plays the host's vibration requests on the local controllers.
+pub fn spawn(out: mpsc::UnboundedSender<ClientMsg>, stop: Arc<AtomicBool>) -> RumbleSender {
+    let (rumble_tx, rumble_rx) = std::sync::mpsc::channel::<(u8, u8)>();
     let _ = std::thread::Builder::new().name("gamepad".into()).spawn(move || {
         let mut gilrs = match Gilrs::new() {
             Ok(g) => g,
@@ -24,9 +32,14 @@ pub fn spawn(out: mpsc::UnboundedSender<ClientMsg>, stop: Arc<AtomicBool>) {
             }
         };
         let mut last = GamepadState::default();
+        let mut effect: Option<Effect> = None;
         while !stop.load(Ordering::Relaxed) {
-            // Wakes on any controller event; the timeout only bounds how long `stop` goes unnoticed.
-            if gilrs.next_event_blocking(Some(Duration::from_millis(100))).is_none() {
+            // Only the newest vibration level matters.
+            if let Some((large, small)) = rumble_rx.try_iter().last() {
+                effect = set_rumble(&mut gilrs, effect.take(), large, small);
+            }
+            // The timeout bounds how late a vibration change or `stop` is noticed.
+            if gilrs.next_event_blocking(Some(Duration::from_millis(10))).is_none() {
                 continue;
             }
             while gilrs.next_event().is_some() {}
@@ -38,7 +51,36 @@ pub fn spawn(out: mpsc::UnboundedSender<ClientMsg>, stop: Arc<AtomicBool>) {
                 }
             }
         }
+        if let Some(e) = effect {
+            let _ = e.stop();
+        }
     });
+    rumble_tx
+}
+
+/// Replaces the running effect with a constant one at the requested motor speeds (or none for 0/0).
+fn set_rumble(gilrs: &mut Gilrs, old: Option<Effect>, large: u8, small: u8) -> Option<Effect> {
+    if let Some(e) = old {
+        let _ = e.stop();
+    }
+    if large == 0 && small == 0 {
+        return None;
+    }
+    let pads: Vec<GamepadId> = gilrs.gamepads().filter(|(_, g)| g.is_ff_supported()).map(|(id, _)| id).collect();
+    if pads.is_empty() {
+        return None;
+    }
+    // A 1 s slot repeated forever (the builder's default) = constant vibration until the next change.
+    let scheduling = Replay { after: Ticks::from_ms(0), play_for: Ticks::from_ms(1000), with_delay: Ticks::from_ms(0) };
+    let effect = EffectBuilder::new()
+        .add_effect(BaseEffect { kind: BaseEffectType::Strong { magnitude: large as u16 * 257 }, scheduling, envelope: Default::default() })
+        .add_effect(BaseEffect { kind: BaseEffectType::Weak { magnitude: small as u16 * 257 }, scheduling, envelope: Default::default() })
+        .gamepads(&pads)
+        .finish(gilrs)
+        .map_err(|e| tracing::debug!("rumble effect: {e}"))
+        .ok()?;
+    effect.play().map_err(|e| tracing::debug!("rumble play: {e}")).ok()?;
+    Some(effect)
 }
 
 fn read(pad: &Gamepad) -> GamepadState {

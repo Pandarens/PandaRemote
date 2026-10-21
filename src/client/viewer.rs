@@ -45,6 +45,8 @@ pub struct Shared {
     /// Problem worth showing next to the status (e.g. no virtual gamepad on the host).
     pub notice: Mutex<Option<String>>,
     pub decoder: Mutex<String>,
+    /// Where host vibration requests go (set by the GUI in the game profile).
+    pub rumble: Mutex<Option<super::gamepad::RumbleSender>>,
     pub decoded: AtomicU32,
     assembled: AtomicU32,
     lost: AtomicU32,
@@ -110,6 +112,17 @@ pub async fn run(
         #[allow(unreachable_code)]
         anyhow::Ok(())
     };
+    let host_messages = async {
+        loop {
+            if let HostMsg::Rumble { large, small } = proto::read_msg::<HostMsg>(&mut recv).await? {
+                if let Some(tx) = shared.rumble.lock().unwrap().as_ref() {
+                    let _ = tx.send((large, small));
+                }
+            }
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    };
     let transmit = async {
         while let Some(msg) = out_rx.recv().await {
             proto::write_msg(&mut send, &msg).await?;
@@ -140,6 +153,7 @@ pub async fn run(
     tokio::select! {
         r = receive => r,
         r = transmit => r,
+        r = host_messages => r,
         _ = stats => Ok(()),
         e = conn.closed() => Err(anyhow::anyhow!("соединение закрыто: {e}")),
     }

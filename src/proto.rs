@@ -75,6 +75,8 @@ pub enum HostMsg {
         /// `None` when a virtual gamepad is available, otherwise why not.
         gamepad_error: Option<String>,
     },
+    /// Force feedback the game set on the virtual controller (0 = off).
+    Rumble { large: u8, small: u8 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

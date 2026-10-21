@@ -6,18 +6,21 @@ use anyhow::Result;
 
 use crate::proto::GamepadState;
 
+/// Rumble motor speeds (large, small) the game requested.
+pub type RumbleSender = tokio::sync::mpsc::UnboundedSender<(u8, u8)>;
+
 /// Plugs in a virtual controller for the session; dropping the sender unplugs it.
 /// Errors (driver not installed) are returned so the viewer can tell the user.
-pub fn spawn() -> Result<mpsc::Sender<GamepadState>> {
+pub fn spawn(rumble: RumbleSender) -> Result<mpsc::Sender<GamepadState>> {
     let (tx, rx) = mpsc::channel::<GamepadState>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
-    std::thread::Builder::new().name("gamepad".into()).spawn(move || run(rx, ready_tx))?;
+    std::thread::Builder::new().name("gamepad".into()).spawn(move || run(rx, ready_tx, rumble))?;
     ready_rx.recv()??;
     Ok(tx)
 }
 
 #[cfg(windows)]
-fn run(rx: mpsc::Receiver<GamepadState>, ready: mpsc::Sender<Result<()>>) {
+fn run(rx: mpsc::Receiver<GamepadState>, ready: mpsc::Sender<Result<()>>, rumble: RumbleSender) {
     use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
 
     let mut target = match Client::connect()
@@ -34,6 +37,16 @@ fn run(rx: mpsc::Receiver<GamepadState>, ready: mpsc::Sender<Result<()>>) {
             return;
         }
     };
+    // Games drive vibration through the virtual pad; the driver reports it back to us.
+    // The notification thread ends by itself when the target is unplugged.
+    match target.request_notification() {
+        Ok(notification) => {
+            notification.spawn_thread(move |_, n| {
+                let _ = rumble.send((n.large_motor, n.small_motor));
+            });
+        }
+        Err(e) => tracing::debug!("rumble notifications unavailable: {e:?}"),
+    }
     let _ = ready.send(Ok(()));
     for s in rx {
         let pad = XGamepad {
@@ -53,6 +66,6 @@ fn run(rx: mpsc::Receiver<GamepadState>, ready: mpsc::Sender<Result<()>>) {
 }
 
 #[cfg(not(windows))]
-fn run(_rx: mpsc::Receiver<GamepadState>, ready: mpsc::Sender<Result<()>>) {
+fn run(_rx: mpsc::Receiver<GamepadState>, ready: mpsc::Sender<Result<()>>, _rumble: RumbleSender) {
     let _ = ready.send(Err(anyhow::anyhow!("виртуальный геймпад поддерживается только на Windows")));
 }
