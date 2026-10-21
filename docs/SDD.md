@@ -165,7 +165,7 @@ src/
 
 ### 4.6 Звук
 
-WASAPI loopback (то, что звучит на хосте) → 48 кГц стерео → Opus 20 мс, ~128 кбит/с → датаграммы. На клиенте — небольшой джиттер-буфер → вывод через cpal.
+WASAPI loopback (то, что звучит на хосте) → 48 кГц стерео → Opus (CELT, low-delay) 20 мс, 128 кбит/с → датаграммы `0x02 | seq u32 | opus`. На клиенте: джиттер-буфер 40 мс (обрезка выше 150 мс), маскировка до 5 потерянных пакетов средствами Opus PLC, вывод через cpal. Opus — чистая Rust-реализация (opus-rs), сборка без CMake.
 
 ### 4.7 Телефон
 
@@ -214,7 +214,7 @@ WASAPI loopback (то, что звучит на хосте) → 48 кГц сте
 
 ## 8. Стек
 
-Rust 2024 · iroh 1.4 · tokio · eframe/egui 0.37 · windows-rs (DXGI, D3D11, Media Foundation, SendInput) · openh264 · reed-solomon-simd · Opus · cpal · gilrs · vigem-client · xcap (GDI fallback) · blake3 · postcard/serde.
+Rust 2024 · iroh 1.4 · tokio · eframe/egui 0.37 · windows-rs (DXGI, D3D11, Media Foundation, SendInput) · openh264 · reed-solomon-simd · opus-rs · cpal · gilrs · vigem-client · xcap (GDI fallback) · blake3 · postcard/serde.
 
 ## 9. Проверено
 
@@ -230,4 +230,6 @@ Rust 2024 · iroh 1.4 · tokio · eframe/egui 0.37 · windows-rs (DXGI, D3D11, M
 | Относительная мышь через SendInput | доходит до хоста (курсор сдвинут) |
 | Нет драйвера ViGEmBus | хост сообщает клиенту «драйвер не установлен», клиент показывает предупреждение |
 | Сканкоды клавиатуры, геймпад с драйвером | не проверено вживую |
-| Звук | в разработке |
+| Звук: WASAPI loopback → Opus → датаграммы | пакеты доходят до клиента |
+| Opus encode→decode (opus-rs), синус 440 Гц | уровень сохранён (юнит-тест) |
+| Воспроизведение звука на отдельном клиенте | не проверено на слух (тест на одном ПК дал бы петлю) |

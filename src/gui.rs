@@ -197,7 +197,7 @@ impl App {
             let res = async {
                 let session = client::connect(&ticket, profile).await?;
                 send(UiEvent::Connected { ticket: ticket_str });
-                viewer::run(session, shared2, out_tx2, out_rx, repaint).await
+                viewer::run(session, shared2, out_tx2, out_rx, repaint, true).await
             }
             .await;
             send(UiEvent::DesktopEnded(res.err().map(|e| format!("{e:#}"))));

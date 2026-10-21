@@ -127,7 +127,8 @@ fn main() -> Result<()> {
                     }
                 });
             }
-            let run = client::viewer::run(session, shared.clone(), tx, rx, repaint);
+            // No playback here: on a same-machine test the host's loopback would capture it (feedback).
+            let run = client::viewer::run(session, shared.clone(), tx, rx, repaint, false);
             let _ = tokio::time::timeout(std::time::Duration::from_secs(seconds), run).await;
             let frame = shared.frame.lock().unwrap().take();
             match frame {

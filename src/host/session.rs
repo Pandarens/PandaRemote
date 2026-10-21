@@ -1,13 +1,17 @@
 //! A streaming session on the host: video goes out as datagrams from the capture thread,
 //! input and statistics come in on the control stream.
 
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::oneshot;
 
 use super::{
+    audio,
     capture::{self, Control},
     gamepad, input,
 };
@@ -37,12 +41,20 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
         },
         Profile::Desktop => (None, None),
     };
+    let audio_stop = Arc::new(AtomicBool::new(false));
+    let audio = match audio::spawn(conn.clone(), audio_stop.clone()) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("audio unavailable: {e:#}");
+            false
+        }
+    };
     let info = HostMsg::StreamInfo {
         width: start.geometry.width,
         height: start.geometry.height,
         fps: profile.fps(),
         encoder: start.encoder,
-        audio: false,
+        audio,
         gamepad_error,
     };
     proto::write_msg(&mut send, &info).await?;
@@ -77,6 +89,7 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
         _ = conn.closed() => Ok(()),
     };
     control.stop.store(true, Ordering::Relaxed);
+    audio_stop.store(true, Ordering::Relaxed);
     // A closed control stream is the normal way a viewer leaves.
     match result {
         Err(e) if is_closed(&e) => Ok(()),

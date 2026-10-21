@@ -2,6 +2,7 @@
 //! and runs a streaming session.
 
 mod capture;
+mod audio;
 pub mod encoder;
 mod gamepad;
 #[cfg(windows)]

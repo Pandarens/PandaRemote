@@ -12,9 +12,12 @@ use anyhow::Result;
 use openh264::{decoder::Decoder, formats::YUVSource};
 use tokio::sync::mpsc;
 
-use super::Session;
+use super::{Session, audio};
 use crate::{
-    media::fec::{self, Frame, Reassembler},
+    media::{
+        audio as audio_pkt,
+        fec::{self, Frame, Reassembler},
+    },
     proto::{self, ClientMsg, HostMsg},
 };
 
@@ -34,6 +37,7 @@ pub struct Shared {
     pub decoded: AtomicU32,
     assembled: AtomicU32,
     lost: AtomicU32,
+    audio_packets: AtomicU32,
 }
 
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
@@ -44,12 +48,14 @@ pub async fn run(
     out_tx: mpsc::UnboundedSender<ClientMsg>,
     mut out_rx: mpsc::UnboundedReceiver<ClientMsg>,
     repaint: Repaint,
+    play_audio: bool,
 ) -> Result<()> {
     let Session { conn, mut send, mut recv, .. } = session;
-    let HostMsg::StreamInfo { width, height, fps, encoder, gamepad_error, .. } = proto::read_msg(&mut recv).await? else {
+    let HostMsg::StreamInfo { width, height, fps, encoder, audio: has_audio, gamepad_error } = proto::read_msg(&mut recv).await? else {
         anyhow::bail!("expected StreamInfo");
     };
     *shared.notice.lock().unwrap() = gamepad_error;
+    let audio_tx = (has_audio && play_audio).then(audio::spawn);
     tracing::info!(width, height, fps, %encoder, "stream info");
 
     // Decoding runs on its own thread; a full queue means the decoder fell behind,
@@ -68,8 +74,16 @@ pub async fn run(
         let mut lost_reported = 0;
         loop {
             let dgram = conn.read_datagram().await?;
-            if dgram.first() != Some(&fec::DGRAM_VIDEO) {
-                continue;
+            match dgram.first() {
+                Some(&fec::DGRAM_VIDEO) => {}
+                Some(&audio_pkt::DGRAM_AUDIO) => {
+                    shared.audio_packets.fetch_add(1, Ordering::Relaxed);
+                    if let Some(tx) = &audio_tx {
+                        let _ = tx.send(dgram);
+                    }
+                    continue;
+                }
+                _ => continue,
             }
             if let Some(frame) = reasm.push(dgram) {
                 shared.assembled.fetch_add(1, Ordering::Relaxed);
@@ -99,10 +113,11 @@ pub async fn run(
             let frames = shared.assembled.swap(0, Ordering::Relaxed);
             let lost = shared.lost.swap(0, Ordering::Relaxed);
             let decoded = shared.decoded.swap(0, Ordering::Relaxed);
+            let audio = if shared.audio_packets.swap(0, Ordering::Relaxed) > 0 { " · 🔊" } else { "" };
             let _ = out_tx.send(ClientMsg::Stats { frames, lost });
             let loss = if frames + lost > 0 { lost * 100 / (frames + lost) } else { 0 };
             *shared.status.lock().unwrap() =
-                format!("{} · {decoded} к/с · потери {loss}% · {encoder}", super::path_summary(&conn));
+                format!("{} · {decoded} к/с · потери {loss}%{audio} · {encoder}", super::path_summary(&conn));
             repaint();
         }
     };
