@@ -39,14 +39,42 @@ pub struct Control {
     pub keyframe: AtomicBool,
     pub stop: AtomicBool,
     pub bitrate: AtomicU32,
+    /// Last frame id sent; kept here so a restarted capture thread continues the sequence.
+    frame_id: AtomicU32,
+}
+
+/// Why a capture thread ended without an error.
+enum Exit {
+    Stopped,
+    /// The input desktop changed (lock screen, UAC) and this thread could not follow it.
+    DesktopChanged,
 }
 
 pub fn run(conn: Connection, profile: Profile, control: Arc<Control>, start_tx: oneshot::Sender<Result<StreamStart>>) {
     let mut start_tx = Some(start_tx);
-    if let Err(e) = capture_loop(&conn, profile, &control, &mut start_tx) {
-        tracing::warn!("capture stopped: {e:#}");
-        if let Some(tx) = start_tx.take() {
-            let _ = tx.send(Err(e));
+    // A thread that owns windows (the encoder may create some) cannot move to another desktop,
+    // so each desktop switch gets a fresh capture thread.
+    loop {
+        let result = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("capture".into())
+                .spawn_scoped(scope, || capture_loop(&conn, profile, &control, &mut start_tx))
+                .map_err(anyhow::Error::from)
+                .and_then(|t| t.join().map_err(|_| anyhow::anyhow!("capture thread panicked"))?)
+        });
+        match result {
+            Ok(Exit::Stopped) => return,
+            Ok(Exit::DesktopChanged) => {
+                tracing::info!("input desktop changed, restarting capture on a fresh thread");
+                control.keyframe.store(true, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!("capture stopped: {e:#}");
+                if let Some(tx) = start_tx.take() {
+                    let _ = tx.send(Err(e));
+                }
+                return;
+            }
         }
     }
 }
@@ -103,6 +131,14 @@ impl Source {
         }
     }
 
+    fn kind(&self) -> &'static str {
+        match self {
+            #[cfg(windows)]
+            Source::Dxgi(_) => "dxgi",
+            Source::Gdi { .. } => "gdi",
+        }
+    }
+
     /// Pixels of the last frame and whether they are BGRA (otherwise RGBA).
     fn pixels(&self) -> (&[u8], bool) {
         match self {
@@ -118,9 +154,10 @@ fn capture_loop(
     profile: Profile,
     control: &Control,
     start_tx: &mut Option<oneshot::Sender<Result<StreamStart>>>,
-) -> Result<()> {
+) -> Result<Exit> {
     let mut source = Source::open()?;
     let (sw, sh) = source.size();
+    tracing::info!(source = source.kind(), width = sw, height = sh, desktop = %current_desktop(), "capture source opened");
     let scale = sw.div_ceil(MAX_WIDTH).max(1);
     // H.264 needs even dimensions.
     let (w, h) = ((sw / scale) & !1, (sh / scale) & !1);
@@ -129,6 +166,7 @@ fn capture_loop(
     let fps = profile.fps();
     let mut bitrate = control.bitrate.load(Ordering::Relaxed);
     let mut encoder = encoder::create(w, h, fps, bitrate, true)?;
+    tracing::info!(encoder = %encoder.name(), "encoder ready");
     if let Some(tx) = start_tx.take() {
         let _ = tx.send(Ok(StreamStart { geometry, encoder: encoder.name() }));
     }
@@ -138,7 +176,6 @@ fn capture_loop(
     let mut have_frame = false;
     let mut dirty = false;
     let mut last_sent: Option<Instant> = None;
-    let mut frame_id: u32 = 0;
     let (mut grabbed, mut encoded, mut encode_time, mut stats_at) = (0u32, 0u32, Duration::ZERO, Instant::now());
     while !control.stop.load(Ordering::Relaxed) {
         if stats_at.elapsed() >= Duration::from_secs(5) {
@@ -164,6 +201,9 @@ fn capture_loop(
                 // Lost duplication: lock screen, UAC prompt, display mode change. Keep retrying.
                 tracing::debug!("capture lost: {e:#}");
                 std::thread::sleep(Duration::from_millis(500));
+                if !on_input_desktop() {
+                    return Ok(Exit::DesktopChanged);
+                }
                 match Source::open() {
                     Ok(s) if s.size() == (sw, sh) => {
                         source = s;
@@ -206,19 +246,35 @@ fn capture_loop(
 
         let max_dgram = conn.max_datagram_size().context("datagrams are not supported on this path")?;
         for f in frames {
-            frame_id = frame_id.wrapping_add(1);
+            let frame_id = control.frame_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             for shard in fec::packetize(frame_id, &f.data, f.keyframe, max_dgram, PARITY_PERCENT)? {
                 // A full send buffer drops the oldest datagrams; FEC and keyframe requests cover that.
                 if let Err(e) = conn.send_datagram(shard) {
                     if conn.close_reason().is_some() {
-                        return Ok(());
+                        return Ok(Exit::Stopped);
                     }
                     tracing::debug!("datagram dropped: {e}");
                 }
             }
         }
     }
-    Ok(())
+    Ok(Exit::Stopped)
+}
+
+fn current_desktop() -> String {
+    #[cfg(windows)]
+    return super::desktop_switch::thread_desktop_name().unwrap_or_else(|| "?".into());
+    #[cfg(not(windows))]
+    "default".into()
+}
+
+/// False when the input desktop (lock screen, UAC) differs from the one this thread is on.
+fn on_input_desktop() -> bool {
+    #[cfg(windows)]
+    return super::desktop_switch::input_desktop_name()
+        .is_none_or(|input| Some(input) == super::desktop_switch::thread_desktop_name());
+    #[cfg(not(windows))]
+    true
 }
 
 /// Crops to `w`×`h` and downscales by `scale` (nearest neighbour).

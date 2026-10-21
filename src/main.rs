@@ -72,6 +72,9 @@ enum Command {
         /// Через 2 с сдвинуть мышь хоста относительным движением и вернуть обратно (проверка ввода)
         #[arg(long, hide = true)]
         nudge: bool,
+        /// Через 2 с выполнить действия через запятую: `click` (клик в центре) или сканкод в hex (нажать и отпустить)
+        #[arg(long, hide = true)]
+        actions: Option<String>,
     },
 }
 
@@ -116,7 +119,8 @@ fn init_logging(cli: &Cli) {
         if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 << 20) {
             let _ = std::fs::remove_file(&path);
         }
-        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            config::share_read_with_users(&path);
             tracing_subscriber::fmt()
                 .with_env_filter(filter())
                 .with_ansi(false)
@@ -204,7 +208,7 @@ fn main() -> Result<()> {
             Ok(())
         }),
         Some(Command::BenchEncoder { sw, fps }) => bench_encoder(!sw, fps),
-        Some(Command::Probe { ticket, out, seconds, game, nudge }) => rt.block_on(async {
+        Some(Command::Probe { ticket, out, seconds, game, nudge, actions }) => rt.block_on(async {
             let ticket = ticket::Ticket::decode(&ticket)?;
             let started = std::time::Instant::now();
             let session = client::connect(&ticket, profile(game)).await?;
@@ -232,15 +236,51 @@ fn main() -> Result<()> {
                 });
             }
             // No playback here: on a same-machine test the host's loopback would capture it (feedback).
+            if let Some(actions) = actions {
+                let (tx, shared) = (tx.clone(), shared.clone());
+                tokio::spawn(async move {
+                    use proto::{ClientMsg::Input, InputEvent::*, MouseButton};
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Test input only ever goes to the lock screen, never into someone's open windows.
+                    if !shared.secure_desktop.load(std::sync::atomic::Ordering::Relaxed) {
+                        println!("Действия пропущены: хост не на экране блокировки");
+                        return;
+                    }
+                    for action in actions.split(',').map(str::trim) {
+                        if action == "click" {
+                            let _ = tx.send(Input(MouseMove { x: 32768, y: 32768 }));
+                            let _ = tx
+                                .send(Input(proto::InputEvent::MouseButton { button: MouseButton::Left, down: true }));
+                            let _ = tx
+                                .send(Input(proto::InputEvent::MouseButton { button: MouseButton::Left, down: false }));
+                        } else if let Ok(code) = u16::from_str_radix(action, 16) {
+                            let _ = tx.send(Input(Scancode { code, extended: false, down: true }));
+                            let _ = tx.send(Input(Scancode { code, extended: false, down: false }));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    }
+                });
+            }
             let run = client::viewer::run(session, shared.clone(), tx, rx, repaint, false);
             let _ = tokio::time::timeout(std::time::Duration::from_secs(seconds), run).await;
             let frame = shared.frame.lock().unwrap().take();
+            if frame.is_none() {
+                println!("Статус без кадров: {}", shared.status.lock().unwrap());
+                println!(
+                    "Экран блокировки (защищённый рабочий стол): {}",
+                    shared.secure_desktop.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
             match frame {
                 Some(f) => {
                     xcap::image::RgbaImage::from_raw(f.width as u32, f.height as u32, f.to_rgba())
                         .ok_or_else(|| anyhow::anyhow!("bad frame"))?
                         .save(&out)?;
                     println!("Последний статус: {}", shared.status.lock().unwrap());
+                    println!(
+                        "Экран блокировки (защищённый рабочий стол): {}",
+                        shared.secure_desktop.load(std::sync::atomic::Ordering::Relaxed)
+                    );
                     println!(
                         "Кадр {}x{} сохранён в {}, событий отрисовки: {}",
                         f.width,

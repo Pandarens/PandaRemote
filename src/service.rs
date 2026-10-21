@@ -58,6 +58,12 @@ pub fn install() -> Result<()> {
     let to = config::machine_dir();
     std::fs::create_dir_all(&to).with_context(|| format!("create {}", to.display()))?;
     lock_down(to.parent().unwrap_or(&to))?;
+    // Users may enter the directories (to read the logs and journal shared with them), nothing more.
+    for dir in [to.parent().unwrap_or(&to), to.as_path()] {
+        icacls(dir, &["/grant", "*S-1-5-32-545:(RX)", "/Q"])?;
+    }
+    // The service runs its own copy, so the original can be rebuilt or moved while it runs.
+    let exe = install_binary()?;
     let from = config::user_dir();
     for name in config::HOST_FILES {
         let (src, dst) = (from.join(name), to.join(name));
@@ -73,7 +79,7 @@ pub fn install() -> Result<()> {
         service_type: SERVICE_TYPE,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: std::env::current_exe()?,
+        executable_path: exe,
         launch_arguments: vec!["service".into(), "run".into()],
         dependencies: vec![],
         account_name: None, // LocalSystem
@@ -91,15 +97,35 @@ pub fn install() -> Result<()> {
 /// Owner = Administrators, no inheritance, full control for SYSTEM and Administrators only (by SID, so it
 /// works on localized Windows).
 fn lock_down(dir: &std::path::Path) -> Result<()> {
-    let run = |args: &[&str]| -> Result<()> {
-        let out = std::process::Command::new("icacls").arg(dir).args(args).output().context("icacls")?;
-        if !out.status.success() {
-            bail!("icacls {:?} failed: {}", args, String::from_utf8_lossy(&out.stdout));
-        }
-        Ok(())
-    };
-    run(&["/setowner", "*S-1-5-32-544", "/T", "/Q"])?;
-    run(&["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/Q"])
+    icacls(dir, &["/setowner", "*S-1-5-32-544", "/T", "/Q"])?;
+    icacls(dir, &["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/Q"])
+}
+
+fn icacls(path: &std::path::Path, args: &[&str]) -> Result<()> {
+    let out = std::process::Command::new("icacls").arg(path).args(args).output().context("icacls")?;
+    if !out.status.success() {
+        bail!("icacls {:?} failed: {}", args, String::from_utf8_lossy(&out.stdout));
+    }
+    Ok(())
+}
+
+/// Copies the running executable to `%ProgramFiles%\PandaRC\panda-rc.exe` (admin-only, like any program there).
+fn install_binary() -> Result<std::path::PathBuf> {
+    let target = install_binary_path()?;
+    std::fs::create_dir_all(target.parent().unwrap()).with_context(|| format!("create {}", target.display()))?;
+    let current = std::env::current_exe()?;
+    if current != target {
+        std::fs::copy(&current, &target).with_context(|| format!("copy program to {}", target.display()))?;
+    }
+    Ok(target)
+}
+
+fn install_binary_path() -> Result<std::path::PathBuf> {
+    let dir = std::env::var_os("ProgramFiles")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Program Files"))
+        .join("PandaRC");
+    Ok(dir.join("panda-rc.exe"))
 }
 
 pub fn uninstall() -> Result<()> {
@@ -119,6 +145,12 @@ pub fn uninstall() -> Result<()> {
     }
     service.delete()?;
     config::set_service_installed(false)?;
+    // The installed copy is no longer in use (best effort: it may still be shutting down).
+    if let Ok(exe) = install_binary_path()
+        && exe != std::env::current_exe()?
+    {
+        let _ = std::fs::remove_file(exe);
+    }
     Ok(())
 }
 

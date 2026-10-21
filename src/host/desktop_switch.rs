@@ -29,6 +29,11 @@ pub fn input_desktop_name() -> Option<String> {
     }
 }
 
+/// Name of the desktop the calling thread is attached to.
+pub fn thread_desktop_name() -> Option<String> {
+    unsafe { GetThreadDesktop(GetCurrentThreadId()).ok().and_then(desktop_name) }
+}
+
 /// Moves the calling thread to the input desktop if it changed. Returns true on a switch.
 pub fn follow_input_desktop() -> bool {
     unsafe {

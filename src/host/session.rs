@@ -42,6 +42,7 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
         },
         Profile::Desktop => (None, None),
     };
+    tracing::info!("starting audio");
     let audio_stop = Arc::new(AtomicBool::new(false));
     let audio = match audio::spawn(conn.clone(), audio_stop.clone()) {
         Ok(()) => true,

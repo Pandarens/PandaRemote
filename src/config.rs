@@ -47,6 +47,23 @@ pub fn set_service_installed(installed: bool) -> Result<()> {
     Ok(())
 }
 
+/// Grants the local Users group read access to a non-secret file in the locked-down machine directory
+/// (logs, journal). Best effort: does nothing when not allowed (e.g. a normal user process).
+pub fn share_read_with_users(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/grant", "*S-1-5-32-545:R", "/Q"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
 /// Where the host's identity, secret and journal live.
 pub fn host_dir() -> PathBuf {
     override_dir().unwrap_or_else(|| if service_installed() { machine_dir() } else { user_dir() })
@@ -194,7 +211,12 @@ pub fn journal(client_id: &str, client_name: &str, event: &str, detail: &str) {
     };
     tracing::info!(client_id, client_name, event, detail, "journal");
     let write = || -> Result<()> {
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(host_path("connections.log")?)?;
+        let path = host_path("connections.log")?;
+        let created = !path.exists();
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        if created {
+            share_read_with_users(&path);
+        }
         writeln!(f, "{}", serde_json::to_string(&entry)?)?;
         Ok(())
     };
