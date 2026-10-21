@@ -2,11 +2,11 @@
 //! and runs a streaming session.
 
 mod capture;
-mod desktop;
 pub mod encoder;
 #[cfg(windows)]
 mod dxgi;
 mod input;
+mod session;
 
 use std::{sync::Arc, time::{Duration, Instant}};
 
@@ -19,7 +19,7 @@ use iroh::{
 
 use crate::{
     config::{self, HostConfig},
-    proto::{self, ClientMsg, HostMsg, PROTOCOL_VERSION, SessionKind},
+    proto::{self, ClientMsg, HostMsg, PROTOCOL_VERSION},
     ticket::Ticket,
 };
 
@@ -30,8 +30,7 @@ pub struct Host {
 
 impl Host {
     pub async fn start(cfg: HostConfig) -> Result<Self> {
-        #[cfg(windows)]
-        let _ = enigo::set_dpi_awareness();
+        input::set_dpi_aware();
 
         let endpoint = proto::bind_endpoint(config::host_key()?).await?;
         let id = endpoint.id();
@@ -85,7 +84,7 @@ impl Handler {
         let cid = client_id.to_string();
         let (mut send, mut recv) = conn.accept_bi().await?;
 
-        let ClientMsg::Hello { version, client_name, kind } = proto::read_msg(&mut recv).await? else {
+        let ClientMsg::Hello { version, client_name, profile } = proto::read_msg(&mut recv).await? else {
             bail!("expected Hello");
         };
         let nonce = config::random_bytes();
@@ -113,14 +112,10 @@ impl Handler {
         }
         proto::write_msg(&mut send, &HostMsg::AuthResult { ok: true, reason: String::new() }).await?;
 
-        let kind_name = match kind {
-            SessionKind::Desktop => "desktop",
-        };
+        let kind_name = profile.name();
         config::journal(&cid, &client_name, "connected", kind_name);
         let started = Instant::now();
-        let result = match kind {
-            SessionKind::Desktop => desktop::serve(&conn, send, recv).await,
-        };
+        let result = session::serve(&conn, profile, send, recv).await;
         let detail = match &result {
             Ok(()) => format!("{kind_name}, {} с", started.elapsed().as_secs()),
             Err(e) => format!("{kind_name}, {} с, {e:#}", started.elapsed().as_secs()),

@@ -1,28 +1,25 @@
-//! Screen capture + H.264 encoding, running on a dedicated thread.
+//! Capture thread: screen -> H.264 -> FEC shards -> QUIC datagrams.
 
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use openh264::{
-    OpenH264API,
-    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, RateControlMode, UsageType},
-    formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer},
-};
-use tokio::sync::{mpsc, oneshot};
+use iroh::endpoint::Connection;
+use tokio::sync::oneshot;
 use xcap::Monitor;
 
-use crate::proto::VideoFrame;
+use super::encoder::{self, Picture};
+use crate::{media::fec, proto::Profile};
 
-const FPS: f32 = 30.0;
-const BITRATE: u32 = 8_000_000;
-/// Frames wider than this are downscaled by an integer factor to keep software encoding real-time.
+/// Frames wider than this are downscaled by an integer factor.
 const MAX_WIDTH: u32 = 2560;
+/// Reed-Solomon parity added to every frame.
+const PARITY_PERCENT: u32 = 20;
 
 /// Streamed frame size; also the primary monitor's coordinate space divided by `scale`.
 #[derive(Clone, Copy, Debug)]
@@ -32,17 +29,25 @@ pub struct Geometry {
     pub scale: u32,
 }
 
-pub fn run(
-    tx: mpsc::Sender<VideoFrame>,
-    geo_tx: oneshot::Sender<Result<Geometry>>,
-    keyframe: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-) {
-    let mut geo_tx = Some(geo_tx);
-    if let Err(e) = capture_loop(&tx, &mut geo_tx, &keyframe, &stop) {
+pub struct StreamStart {
+    pub geometry: Geometry,
+    pub encoder: String,
+}
+
+/// Knobs the network side turns while the capture thread runs.
+#[derive(Default)]
+pub struct Control {
+    pub keyframe: AtomicBool,
+    pub stop: AtomicBool,
+    pub bitrate: AtomicU32,
+}
+
+pub fn run(conn: Connection, profile: Profile, control: Arc<Control>, start_tx: oneshot::Sender<Result<StreamStart>>) {
+    let mut start_tx = Some(start_tx);
+    if let Err(e) = capture_loop(&conn, profile, &control, &mut start_tx) {
         tracing::warn!("capture stopped: {e:#}");
-        if let Some(g) = geo_tx.take() {
-            let _ = g.send(Err(e));
+        if let Some(tx) = start_tx.take() {
+            let _ = tx.send(Err(e));
         }
     }
 }
@@ -103,38 +108,52 @@ impl Source {
 }
 
 fn capture_loop(
-    tx: &mpsc::Sender<VideoFrame>,
-    geo_tx: &mut Option<oneshot::Sender<Result<Geometry>>>,
-    keyframe: &AtomicBool,
-    stop: &AtomicBool,
+    conn: &Connection,
+    profile: Profile,
+    control: &Control,
+    start_tx: &mut Option<oneshot::Sender<Result<StreamStart>>>,
 ) -> Result<()> {
     let mut source = Source::open()?;
     let (sw, sh) = source.size();
     let scale = sw.div_ceil(MAX_WIDTH).max(1);
     // H.264 needs even dimensions.
     let (w, h) = ((sw / scale) & !1, (sh / scale) & !1);
-    let geo = Geometry { width: w, height: h, scale };
-    if let Some(g) = geo_tx.take() {
-        let _ = g.send(Ok(geo));
+    let geometry = Geometry { width: w, height: h, scale };
+
+    let fps = profile.fps();
+    let mut bitrate = control.bitrate.load(Ordering::Relaxed);
+    let mut encoder = encoder::create(w, h, fps, bitrate, true)?;
+    if let Some(tx) = start_tx.take() {
+        let _ = tx.send(Ok(StreamStart { geometry, encoder: encoder.name() }));
     }
 
-    let config = EncoderConfig::new()
-        .usage_type(UsageType::ScreenContentRealTime)
-        .rate_control_mode(RateControlMode::Bitrate)
-        .bitrate(BitRate::from_bps(BITRATE))
-        .max_frame_rate(FrameRate::from_hz(FPS))
-        .intra_frame_period(IntraFramePeriod::from_num_frames((FPS * 5.0) as u32))
-        .skip_frames(true);
-    let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), config)?;
-
-    let interval = Duration::from_secs_f32(1.0 / FPS);
+    let interval = Duration::from_secs_f64(1.0 / fps as f64);
     let mut packed = vec![0u8; (w * h * 4) as usize];
     let mut have_frame = false;
+    let mut dirty = false;
     let mut last_sent: Option<Instant> = None;
-    while !stop.load(Ordering::Relaxed) {
-        let started = Instant::now();
-        let changed = match source.grab(interval) {
-            Ok(c) => c,
+    let mut frame_id: u32 = 0;
+    let (mut grabbed, mut encoded, mut encode_time, mut stats_at) = (0u32, 0u32, Duration::ZERO, Instant::now());
+    while !control.stop.load(Ordering::Relaxed) {
+        if stats_at.elapsed() >= Duration::from_secs(5) {
+            let secs = stats_at.elapsed().as_secs_f32();
+            tracing::debug!(
+                grabbed_fps = grabbed as f32 / secs,
+                encoded_fps = encoded as f32 / secs,
+                encode_ms = encode_time.as_secs_f32() * 1000.0 / encoded.max(1) as f32,
+                "capture stats"
+            );
+            (grabbed, encoded, encode_time, stats_at) = (0, 0, Duration::ZERO, Instant::now());
+        }
+        // Wait for a screen update, but never longer than until the next frame slot is due.
+        let since = last_sent.map_or(interval, |t| t.elapsed());
+        let wait = interval.saturating_sub(since).max(Duration::from_millis(1));
+        match source.grab(wait) {
+            Ok(changed) => {
+                grabbed += changed as u32;
+                have_frame |= changed;
+                dirty |= changed;
+            }
             Err(e) => {
                 // Lost duplication: lock screen, UAC prompt, display mode change. Keep retrying.
                 tracing::debug!("capture lost: {e:#}");
@@ -142,51 +161,55 @@ fn capture_loop(
                 match Source::open() {
                     Ok(s) if s.size() == (sw, sh) => {
                         source = s;
-                        keyframe.store(true, Ordering::Relaxed);
+                        control.keyframe.store(true, Ordering::Relaxed);
                     }
                     Ok(_) => bail!("разрешение экрана изменилось, переподключитесь"),
                     Err(_) => {}
                 }
                 continue;
             }
-        };
-        have_frame |= changed;
-        let force_key = keyframe.swap(false, Ordering::Relaxed);
-        // Static screen: refresh once a second so a late viewer/decoder recovers.
-        let refresh = last_sent.is_none_or(|t| t.elapsed() > Duration::from_secs(1));
-        if !have_frame || !(changed || force_key || refresh) {
+        }
+        let since = last_sent.map_or(interval, |t| t.elapsed());
+        let force_key = control.keyframe.load(Ordering::Relaxed);
+        // A static screen is refreshed once a second so a recovering decoder gets a picture.
+        let refresh = since > Duration::from_secs(1);
+        if !have_frame || since < interval.mul_f32(0.9) || !(dirty || force_key || refresh) {
             continue;
         }
 
-        let (raw, is_bgra) = source.pixels();
-        let px: &[u8] = if scale == 1 && (w, h) == (sw, sh) {
+        let target = control.bitrate.load(Ordering::Relaxed);
+        if target != bitrate {
+            bitrate = target;
+            encoder.set_bitrate(bitrate);
+        }
+        let (raw, bgra) = source.pixels();
+        let pixels: &[u8] = if scale == 1 && (w, h) == (sw, sh) {
             raw
         } else {
             pack(raw, sw, scale, w, h, &mut packed);
             &packed
         };
-        let dims = (w as usize, h as usize);
-        let yuv = if is_bgra {
-            YUVBuffer::from_rgb_source(BgraSliceU8::new(px, dims))
-        } else {
-            YUVBuffer::from_rgb_source(RgbaSliceU8::new(px, dims))
-        };
-        if force_key {
-            encoder.force_intra_frame();
-        }
-        let bitstream = encoder.encode(&yuv)?;
-        let is_key = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);
-        let data = bitstream.to_vec();
-        if !data.is_empty() {
-            let frame = VideoFrame { width: w, height: h, keyframe: is_key, data };
-            // Capacity 1: blocks while the network is behind, which lowers the frame rate instead of queueing.
-            if tx.blocking_send(frame).is_err() {
-                break;
+        control.keyframe.store(false, Ordering::Relaxed);
+        let encode_started = Instant::now();
+        let frames = encoder.encode(&Picture { pixels, width: w, height: h, bgra }, force_key)?;
+        encode_time += encode_started.elapsed();
+        encoded += 1;
+        dirty = false;
+        // Frame slots are measured from when encoding started, so encode time doesn't eat into the next slot.
+        last_sent = Some(encode_started);
+
+        let max_dgram = conn.max_datagram_size().context("datagrams are not supported on this path")?;
+        for f in frames {
+            frame_id = frame_id.wrapping_add(1);
+            for shard in fec::packetize(frame_id, &f.data, f.keyframe, max_dgram, PARITY_PERCENT)? {
+                // A full send buffer drops the oldest datagrams; FEC and keyframe requests cover that.
+                if let Err(e) = conn.send_datagram(shard) {
+                    if conn.close_reason().is_some() {
+                        return Ok(());
+                    }
+                    tracing::debug!("datagram dropped: {e}");
+                }
             }
-            last_sent = Some(Instant::now());
-        }
-        if let Some(rest) = interval.checked_sub(started.elapsed()) {
-            std::thread::sleep(rest);
         }
     }
     Ok(())

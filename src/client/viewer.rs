@@ -1,11 +1,11 @@
-//! Remote-desktop viewer networking: receives and decodes video, sends input.
+//! Viewer networking: datagrams -> FEC reassembly -> H.264 decode; input and stats go back on the control stream.
 
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -13,7 +13,10 @@ use openh264::{decoder::Decoder, formats::YUVSource};
 use tokio::sync::mpsc;
 
 use super::Session;
-use crate::proto::{self, ClientMsg, HostMsg, VideoFrame};
+use crate::{
+    media::fec::{self, Frame, Reassembler},
+    proto::{self, ClientMsg, HostMsg},
+};
 
 pub struct RgbaFrame {
     pub width: usize,
@@ -26,7 +29,9 @@ pub struct RgbaFrame {
 pub struct Shared {
     pub frame: Mutex<Option<RgbaFrame>>,
     pub status: Mutex<String>,
-    frames: AtomicU32,
+    pub decoded: AtomicU32,
+    assembled: AtomicU32,
+    lost: AtomicU32,
 }
 
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
@@ -39,27 +44,43 @@ pub async fn run(
     repaint: Repaint,
 ) -> Result<()> {
     let Session { conn, mut send, mut recv, .. } = session;
-    let HostMsg::ScreenInfo { width, height } = proto::read_msg(&mut recv).await? else {
-        anyhow::bail!("expected ScreenInfo");
+    let HostMsg::StreamInfo { width, height, fps, encoder, .. } = proto::read_msg(&mut recv).await? else {
+        anyhow::bail!("expected StreamInfo");
     };
-    tracing::info!(width, height, "remote screen");
-    let mut video = conn.accept_uni().await?;
+    tracing::info!(width, height, fps, %encoder, "stream info");
 
-    let (dec_tx, dec_rx) = mpsc::channel::<VideoFrame>(8);
+    // Decoding runs on its own thread; a full queue means the decoder fell behind,
+    // so the frame is dropped and the decoder resyncs on the next keyframe.
+    let (dec_tx, dec_rx) = mpsc::channel::<Frame>(4);
+    let resync = Arc::new(AtomicBool::new(false));
     {
-        let (shared, repaint, out_tx) = (shared.clone(), repaint.clone(), out_tx.clone());
+        let (shared, repaint, out_tx, resync) = (shared.clone(), repaint.clone(), out_tx.clone(), resync.clone());
         std::thread::Builder::new()
             .name("decoder".into())
-            .spawn(move || decode_loop(dec_rx, shared, out_tx, repaint))?;
+            .spawn(move || decode_loop(dec_rx, shared, out_tx, resync, repaint))?;
     }
 
     let receive = async {
+        let mut reasm = Reassembler::default();
+        let mut lost_reported = 0;
         loop {
-            let frame: VideoFrame = proto::read_msg(&mut video).await?;
-            if dec_tx.send(frame).await.is_err() {
-                anyhow::bail!("decoder stopped");
+            let dgram = conn.read_datagram().await?;
+            if dgram.first() != Some(&fec::DGRAM_VIDEO) {
+                continue;
+            }
+            if let Some(frame) = reasm.push(dgram) {
+                shared.assembled.fetch_add(1, Ordering::Relaxed);
+                if dec_tx.try_send(frame).is_err() {
+                    resync.store(true, Ordering::Relaxed);
+                }
+            }
+            if reasm.lost != lost_reported {
+                shared.lost.fetch_add(reasm.lost - lost_reported, Ordering::Relaxed);
+                lost_reported = reasm.lost;
             }
         }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
     };
     let transmit = async {
         while let Some(msg) = out_rx.recv().await {
@@ -67,12 +88,18 @@ pub async fn run(
         }
         anyhow::Ok(())
     };
-    let status = async {
+    let stats = async {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.tick().await;
         loop {
             tick.tick().await;
-            let fps = shared.frames.swap(0, Ordering::Relaxed);
-            *shared.status.lock().unwrap() = format!("{} · {fps} к/с", super::path_summary(&conn));
+            let frames = shared.assembled.swap(0, Ordering::Relaxed);
+            let lost = shared.lost.swap(0, Ordering::Relaxed);
+            let decoded = shared.decoded.swap(0, Ordering::Relaxed);
+            let _ = out_tx.send(ClientMsg::Stats { frames, lost });
+            let loss = if frames + lost > 0 { lost * 100 / (frames + lost) } else { 0 };
+            *shared.status.lock().unwrap() =
+                format!("{} · {decoded} к/с · потери {loss}% · {encoder}", super::path_summary(&conn));
             repaint();
         }
     };
@@ -80,15 +107,16 @@ pub async fn run(
     tokio::select! {
         r = receive => r,
         r = transmit => r,
-        _ = status => Ok(()),
+        _ = stats => Ok(()),
         e = conn.closed() => Err(anyhow::anyhow!("соединение закрыто: {e}")),
     }
 }
 
 fn decode_loop(
-    mut rx: mpsc::Receiver<VideoFrame>,
+    mut rx: mpsc::Receiver<Frame>,
     shared: Arc<Shared>,
     out_tx: mpsc::UnboundedSender<ClientMsg>,
+    resync: Arc<AtomicBool>,
     repaint: Repaint,
 ) {
     let mut decoder = match Decoder::new() {
@@ -98,20 +126,38 @@ fn decode_loop(
             return;
         }
     };
+    // Until the first keyframe (and after any loss) P-frames would decode into garbage.
+    let mut awaiting_key = true;
+    let mut last_request: Option<Instant> = None;
+    let request_key = |last: &mut Option<Instant>| {
+        if last.is_none_or(|t| t.elapsed() > Duration::from_millis(200)) {
+            *last = Some(Instant::now());
+            let _ = out_tx.send(ClientMsg::RequestKeyframe);
+        }
+    };
     while let Some(frame) = rx.blocking_recv() {
+        if frame.after_gap || resync.swap(false, Ordering::Relaxed) {
+            awaiting_key = true;
+        }
+        if awaiting_key && !frame.keyframe {
+            request_key(&mut last_request);
+            continue;
+        }
+        awaiting_key = false;
         match decoder.decode(&frame.data) {
             Ok(Some(yuv)) => {
                 let (w, h) = yuv.dimensions();
                 let mut pixels = vec![0u8; w * h * 4];
                 yuv.write_rgba8(&mut pixels);
                 *shared.frame.lock().unwrap() = Some(RgbaFrame { width: w, height: h, pixels });
-                shared.frames.fetch_add(1, Ordering::Relaxed);
+                shared.decoded.fetch_add(1, Ordering::Relaxed);
                 repaint();
             }
             Ok(None) => {}
             Err(e) => {
                 tracing::debug!("decode error, requesting keyframe: {e}");
-                let _ = out_tx.send(ClientMsg::RequestKeyframe);
+                awaiting_key = true;
+                request_key(&mut last_request);
             }
         }
     }

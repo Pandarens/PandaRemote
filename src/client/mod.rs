@@ -13,7 +13,7 @@ use tokio::sync::OnceCell;
 
 use crate::{
     config,
-    proto::{self, ClientMsg, HostMsg, PROTOCOL_VERSION, SessionKind},
+    proto::{self, ClientMsg, HostMsg, PROTOCOL_VERSION, Profile},
     ticket::Ticket,
 };
 
@@ -37,7 +37,7 @@ pub struct Session {
     pub host_name: String,
 }
 
-pub async fn connect(ticket: &Ticket, kind: SessionKind) -> Result<Session> {
+pub async fn connect(ticket: &Ticket, profile: Profile) -> Result<Session> {
     let ep = endpoint().await?;
     let conn = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(ticket.host_id, proto::ALPN))
         .await
@@ -48,7 +48,7 @@ pub async fn connect(ticket: &Ticket, kind: SessionKind) -> Result<Session> {
     let hello = ClientMsg::Hello {
         version: PROTOCOL_VERSION,
         client_name: config::machine_name(),
-        kind,
+        profile,
     };
     proto::write_msg(&mut send, &hello).await?;
     let HostMsg::Challenge { nonce, host_name } = proto::read_msg(&mut recv).await? else {

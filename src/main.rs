@@ -5,6 +5,7 @@ mod client;
 mod config;
 mod gui;
 mod host;
+mod media;
 mod proto;
 mod ticket;
 
@@ -30,8 +31,13 @@ enum Command {
     },
     /// Показать билет подключения к этому ПК
     Ticket,
-    /// Открыть окно удалённого рабочего стола
-    Connect { ticket: String },
+    /// Открыть окно сеанса (рабочий стол или игра)
+    Connect {
+        ticket: String,
+        /// Игровой профиль: 60 к/с, захват мыши, геймпад
+        #[arg(long)]
+        game: bool,
+    },
     /// Показать журнал подключений к этому ПК
     Log,
     /// Диагностика: скорость H.264-энкодера на синтетических кадрах 1080p
@@ -49,6 +55,8 @@ enum Command {
         out: std::path::PathBuf,
         #[arg(long, default_value_t = 5)]
         seconds: u64,
+        #[arg(long)]
+        game: bool,
     },
 }
 
@@ -65,7 +73,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         None => gui::run(rt, None),
-        Some(Command::Connect { ticket }) => gui::run(rt, Some(ticket::Ticket::decode(&ticket)?)),
+        Some(Command::Connect { ticket, game }) => gui::run(rt, Some((ticket::Ticket::decode(&ticket)?, profile(game)))),
         Some(Command::Ticket) => {
             let cfg = config::HostConfig::load_or_create()?;
             let t = ticket::Ticket { host_id: config::host_key()?.public(), secret: cfg.access_secret };
@@ -94,10 +102,10 @@ fn main() -> Result<()> {
             Ok(())
         }),
         Some(Command::BenchEncoder { sw, fps }) => bench_encoder(!sw, fps),
-        Some(Command::Probe { ticket, out, seconds }) => rt.block_on(async {
+        Some(Command::Probe { ticket, out, seconds, game }) => rt.block_on(async {
             let ticket = ticket::Ticket::decode(&ticket)?;
             let started = std::time::Instant::now();
-            let session = client::connect(&ticket, proto::SessionKind::Desktop).await?;
+            let session = client::connect(&ticket, profile(game)).await?;
             println!("Подключено к «{}» за {:?} ({})", session.host_name, started.elapsed(), client::path_summary(&session.conn));
             let shared = Arc::new(client::viewer::Shared::default());
             let frames = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -114,6 +122,7 @@ fn main() -> Result<()> {
                     xcap::image::RgbaImage::from_raw(f.width as u32, f.height as u32, f.pixels)
                         .ok_or_else(|| anyhow::anyhow!("bad frame"))?
                         .save(&out)?;
+                    println!("Последний статус: {}", shared.status.lock().unwrap());
                     println!("Кадр {}x{} сохранён в {}, событий отрисовки: {}", f.width, f.height, out.display(), frames.load(std::sync::atomic::Ordering::Relaxed));
                     Ok(())
                 }
@@ -121,6 +130,10 @@ fn main() -> Result<()> {
             }
         }),
     }
+}
+
+fn profile(game: bool) -> proto::Profile {
+    if game { proto::Profile::Game } else { proto::Profile::Desktop }
 }
 
 fn bench_encoder(hw: bool, fps: u32) -> Result<()> {
@@ -131,6 +144,7 @@ fn bench_encoder(hw: bool, fps: u32) -> Result<()> {
     let mut decoder = openh264::decoder::Decoder::new()?;
     let mut pixels = vec![0u8; (w * h * 4) as usize];
     let (mut total, mut bytes, mut frames, mut keys, mut decoded) = (std::time::Duration::ZERO, 0usize, 0, 0, 0);
+    let mut decode_time = std::time::Duration::ZERO;
     for i in 0..180u32 {
         // Moving gradient + a sliding white bar: realistic motion for the rate control.
         for y in 0..h {
@@ -150,15 +164,20 @@ fn bench_encoder(hw: bool, fps: u32) -> Result<()> {
             frames += 1;
             bytes += f.data.len();
             keys += f.keyframe as u32;
-            if decoder.decode(&f.data)?.is_some() {
+            let t = std::time::Instant::now();
+            if let Some(yuv) = decoder.decode(&f.data)? {
+                let mut rgba = vec![0u8; (w * h * 4) as usize];
+                yuv.write_rgba8(&mut rgba);
                 decoded += 1;
             }
+            decode_time += t.elapsed();
         }
     }
     println!(
-        "180 кадров: {:.2} мс/кадр (с конвертацией), выход {frames} кадров, IDR {keys}, средний размер {} КБ, декодировано {decoded}",
+        "180 кадров: {:.2} мс/кадр (с конвертацией), выход {frames} кадров, IDR {keys}, средний размер {} КБ, декодировано {decoded} ({:.2} мс/кадр с RGBA)",
         total.as_secs_f64() * 1000.0 / 180.0,
-        bytes / frames.max(1) / 1024
+        bytes / frames.max(1) / 1024,
+        decode_time.as_secs_f64() * 1000.0 / decoded.max(1) as f64
     );
     Ok(())
 }

@@ -1,118 +1,220 @@
-//! Injects the viewer's mouse/keyboard events on the host (enigo) from a dedicated thread.
+//! Injects the viewer's input with `SendInput` from a dedicated thread.
+//! Scancodes and raw relative mouse motion are what games reading DirectInput/Raw Input expect.
 
-use std::sync::mpsc;
+use std::{collections::HashSet, sync::mpsc};
 
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-
-use super::capture::Geometry;
 use crate::proto::{InputEvent, KeyCode, Modifiers, MouseButton};
 
-pub fn spawn(geo: Geometry) -> mpsc::Sender<InputEvent> {
+pub fn spawn() -> mpsc::Sender<InputEvent> {
     let (tx, rx) = mpsc::channel::<InputEvent>();
     std::thread::Builder::new()
         .name("input".into())
         .spawn(move || {
-            let mut enigo = match Enigo::new(&Settings::default()) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::error!("input injection unavailable: {e}");
-                    return;
-                }
-            };
+            let mut injector = Injector::default();
             for ev in rx {
-                if let Err(e) = apply(&mut enigo, geo, ev) {
-                    tracing::debug!("input event failed: {e}");
-                }
+                injector.apply(ev);
             }
+            // Viewer gone: never leave a key or button stuck down on the host.
+            injector.release_all();
         })
         .expect("spawn input thread");
     tx
 }
 
-fn apply(enigo: &mut Enigo, geo: Geometry, ev: InputEvent) -> enigo::InputResult<()> {
-    match ev {
-        InputEvent::MouseMove { x, y } => {
-            // Normalized frame coordinates -> primary monitor pixels (enigo's Abs space).
-            let sx = (x as u64 * (geo.width * geo.scale - 1) as u64 / 65535) as i32;
-            let sy = (y as u64 * (geo.height * geo.scale - 1) as u64 / 65535) as i32;
-            enigo.move_mouse(sx, sy, Coordinate::Abs)
+#[derive(Default)]
+struct Injector {
+    keys: HashSet<(u16, bool)>,
+    buttons: HashSet<u8>,
+}
+
+#[cfg(not(windows))]
+impl Injector {
+    fn apply(&mut self, _ev: InputEvent) {}
+    fn release_all(&mut self) {}
+}
+
+#[cfg(windows)]
+mod win {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+
+    pub fn mouse(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT { dx, dy, mouseData: data as u32, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+            },
+        };
+        send(&[input]);
+    }
+
+    pub fn key(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+            },
         }
-        InputEvent::MouseButton { button, down } => {
-            let b = match button {
-                MouseButton::Left => Button::Left,
-                MouseButton::Right => Button::Right,
-                MouseButton::Middle => Button::Middle,
-            };
-            enigo.button(b, if down { Direction::Press } else { Direction::Release })
+    }
+
+    pub fn send(inputs: &[INPUT]) {
+        unsafe {
+            SendInput(inputs, size_of::<INPUT>() as i32);
         }
-        InputEvent::Wheel { dx, dy } => {
-            if dy != 0 {
-                enigo.scroll(dy, Axis::Vertical)?;
-            }
-            if dx != 0 {
-                enigo.scroll(dx, Axis::Horizontal)?;
-            }
-            Ok(())
+    }
+
+    pub fn scan_of(vk: u16) -> u16 {
+        unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16 }
+    }
+
+    pub fn vk_of_char(c: char) -> Option<u16> {
+        let mut buf = [0u16; 2];
+        let units = c.encode_utf16(&mut buf);
+        if units.len() != 1 {
+            return None;
         }
-        InputEvent::Text(text) => enigo.text(&text),
-        InputEvent::Key { key, down, mods } => {
-            let key = map_key(key);
-            if down {
-                set_mods(enigo, mods, Direction::Press)?;
-                enigo.key(key, Direction::Press)
-            } else {
-                enigo.key(key, Direction::Release)?;
-                set_mods(enigo, mods, Direction::Release)
+        let r = unsafe { VkKeyScanW(units[0]) };
+        (r != -1).then_some((r & 0xff) as u16)
+    }
+}
+
+#[cfg(windows)]
+impl Injector {
+    fn apply(&mut self, ev: InputEvent) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        match ev {
+            InputEvent::MouseMove { x, y } => {
+                // 0..65535 over the primary monitor is exactly MOUSEEVENTF_ABSOLUTE's coordinate space.
+                win::mouse(x as i32, y as i32, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE);
             }
+            InputEvent::MouseRelative { dx, dy } => {
+                win::mouse(dx, dy, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE);
+            }
+            InputEvent::MouseButton { button, down } => {
+                let (id, flags) = match (button, down) {
+                    (MouseButton::Left, true) => (0, MOUSEEVENTF_LEFTDOWN),
+                    (MouseButton::Left, false) => (0, MOUSEEVENTF_LEFTUP),
+                    (MouseButton::Right, true) => (1, MOUSEEVENTF_RIGHTDOWN),
+                    (MouseButton::Right, false) => (1, MOUSEEVENTF_RIGHTUP),
+                    (MouseButton::Middle, true) => (2, MOUSEEVENTF_MIDDLEDOWN),
+                    (MouseButton::Middle, false) => (2, MOUSEEVENTF_MIDDLEUP),
+                };
+                if down {
+                    self.buttons.insert(id);
+                } else {
+                    self.buttons.remove(&id);
+                }
+                win::mouse(0, 0, 0, flags);
+            }
+            InputEvent::Wheel { dx, dy } => {
+                const WHEEL_DELTA: i32 = 120;
+                if dy != 0 {
+                    // Windows: positive wheel data scrolls up.
+                    win::mouse(0, 0, -dy * WHEEL_DELTA, MOUSEEVENTF_WHEEL);
+                }
+                if dx != 0 {
+                    win::mouse(0, 0, dx * WHEEL_DELTA, MOUSEEVENTF_HWHEEL);
+                }
+            }
+            InputEvent::Scancode { code, extended, down } => {
+                let mut flags = KEYEVENTF_SCANCODE;
+                if extended {
+                    flags |= KEYEVENTF_EXTENDEDKEY;
+                }
+                if down {
+                    self.keys.insert((code, extended));
+                } else {
+                    flags |= KEYEVENTF_KEYUP;
+                    self.keys.remove(&(code, extended));
+                }
+                win::send(&[win::key(0, code, flags)]);
+            }
+            InputEvent::Text(text) => {
+                let inputs: Vec<INPUT> = text
+                    .encode_utf16()
+                    .flat_map(|u| [win::key(0, u, KEYEVENTF_UNICODE), win::key(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)])
+                    .collect();
+                win::send(&inputs);
+            }
+            InputEvent::Key { key, down, mods } => {
+                let Some((vk, extended)) = vk_of(key) else { return };
+                let mut seq = Vec::new();
+                let vk_event = |vk: u16, extended: bool, up: bool| {
+                    let mut flags = KEYBD_EVENT_FLAGS(0);
+                    if extended {
+                        flags |= KEYEVENTF_EXTENDEDKEY;
+                    }
+                    if up {
+                        flags |= KEYEVENTF_KEYUP;
+                    }
+                    win::key(vk, win::scan_of(vk), flags)
+                };
+                let mod_keys = modifier_vks(mods);
+                if down {
+                    seq.extend(mod_keys.iter().map(|&m| vk_event(m, m == 0x5B, false)));
+                    seq.push(vk_event(vk, extended, false));
+                } else {
+                    seq.push(vk_event(vk, extended, true));
+                    seq.extend(mod_keys.iter().rev().map(|&m| vk_event(m, m == 0x5B, true)));
+                }
+                win::send(&seq);
+            }
+        }
+    }
+
+    fn release_all(&mut self) {
+        for ev in self
+            .keys
+            .drain()
+            .map(|(code, extended)| InputEvent::Scancode { code, extended, down: false })
+            .chain(self.buttons.drain().map(|b| InputEvent::MouseButton {
+                button: [MouseButton::Left, MouseButton::Right, MouseButton::Middle][b as usize],
+                down: false,
+            }))
+            .collect::<Vec<_>>()
+        {
+            self.apply(ev);
         }
     }
 }
 
-fn set_mods(enigo: &mut Enigo, mods: Modifiers, dir: Direction) -> enigo::InputResult<()> {
-    for (on, key) in [
-        (mods.ctrl, Key::Control),
-        (mods.shift, Key::Shift),
-        (mods.alt, Key::Alt),
-        (mods.meta, Key::Meta),
-    ] {
-        if on {
-            enigo.key(key, dir)?;
-        }
-    }
-    Ok(())
+/// Virtual-key code and the "extended key" flag for desktop-profile keys.
+#[cfg(windows)]
+fn vk_of(key: KeyCode) -> Option<(u16, bool)> {
+    Some(match key {
+        KeyCode::Enter => (0x0D, false),
+        KeyCode::Tab => (0x09, false),
+        KeyCode::Backspace => (0x08, false),
+        KeyCode::Escape => (0x1B, false),
+        KeyCode::Space => (0x20, false),
+        KeyCode::PageUp => (0x21, true),
+        KeyCode::PageDown => (0x22, true),
+        KeyCode::End => (0x23, true),
+        KeyCode::Home => (0x24, true),
+        KeyCode::Left => (0x25, true),
+        KeyCode::Up => (0x26, true),
+        KeyCode::Right => (0x27, true),
+        KeyCode::Down => (0x28, true),
+        KeyCode::Insert => (0x2D, true),
+        KeyCode::Delete => (0x2E, true),
+        KeyCode::F(n) if (1..=12).contains(&n) => (0x70 + n as u16 - 1, false),
+        KeyCode::F(_) => return None,
+        KeyCode::Char(c) => (win::vk_of_char(c.to_ascii_lowercase())?, false),
+    })
 }
 
-fn map_key(key: KeyCode) -> Key {
-    match key {
-        KeyCode::Enter => Key::Return,
-        KeyCode::Tab => Key::Tab,
-        KeyCode::Backspace => Key::Backspace,
-        KeyCode::Escape => Key::Escape,
-        KeyCode::Delete => Key::Delete,
-        KeyCode::Insert => Key::Insert,
-        KeyCode::Home => Key::Home,
-        KeyCode::End => Key::End,
-        KeyCode::PageUp => Key::PageUp,
-        KeyCode::PageDown => Key::PageDown,
-        KeyCode::Up => Key::UpArrow,
-        KeyCode::Down => Key::DownArrow,
-        KeyCode::Left => Key::LeftArrow,
-        KeyCode::Right => Key::RightArrow,
-        KeyCode::Space => Key::Space,
-        KeyCode::F(n) => match n {
-            1 => Key::F1,
-            2 => Key::F2,
-            3 => Key::F3,
-            4 => Key::F4,
-            5 => Key::F5,
-            6 => Key::F6,
-            7 => Key::F7,
-            8 => Key::F8,
-            9 => Key::F9,
-            10 => Key::F10,
-            11 => Key::F11,
-            _ => Key::F12,
-        },
-        KeyCode::Char(c) => Key::Unicode(c.to_ascii_lowercase()),
+#[cfg(windows)]
+fn modifier_vks(mods: Modifiers) -> Vec<u16> {
+    [(mods.ctrl, 0x11), (mods.shift, 0x10), (mods.alt, 0x12), (mods.meta, 0x5B)]
+        .into_iter()
+        .filter_map(|(on, vk)| on.then_some(vk))
+        .collect()
+}
+
+/// Makes absolute coordinates and capture use physical pixels.
+pub fn set_dpi_aware() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 }

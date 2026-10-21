@@ -1,0 +1,123 @@
+//! A streaming session on the host: video goes out as datagrams from the capture thread,
+//! input and statistics come in on the control stream.
+
+use std::sync::{Arc, atomic::Ordering};
+
+use anyhow::Result;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+use tokio::sync::oneshot;
+
+use super::{
+    capture::{self, Control},
+    input,
+};
+use crate::proto::{self, ClientMsg, HostMsg, Profile};
+
+pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
+    let (start_bitrate, min_bitrate, max_bitrate) = profile.bitrate();
+    let control = Arc::new(Control::default());
+    control.bitrate.store(start_bitrate, Ordering::Relaxed);
+
+    let (start_tx, start_rx) = oneshot::channel();
+    {
+        let (conn, control) = (conn.clone(), control.clone());
+        std::thread::Builder::new()
+            .name("capture".into())
+            .spawn(move || capture::run(conn, profile, control, start_tx))?;
+    }
+    let start = start_rx.await??;
+    tracing::info!(encoder = %start.encoder, profile = profile.name(), "stream started");
+    let info = HostMsg::StreamInfo {
+        width: start.geometry.width,
+        height: start.geometry.height,
+        fps: profile.fps(),
+        encoder: start.encoder,
+        audio: false,
+        gamepad_error: Some("ещё не реализовано".into()),
+    };
+    proto::write_msg(&mut send, &info).await?;
+
+    let input_tx = input::spawn();
+    let mut abr = Abr { current: start_bitrate, min: min_bitrate, max: max_bitrate, clean_seconds: 0 };
+
+    let control_loop = async {
+        loop {
+            match proto::read_msg::<ClientMsg>(&mut recv).await? {
+                ClientMsg::Input(ev) => {
+                    let _ = input_tx.send(ev);
+                }
+                ClientMsg::RequestKeyframe => control.keyframe.store(true, Ordering::Relaxed),
+                ClientMsg::Stats { frames, lost } => {
+                    if let Some(bps) = abr.update(frames, lost) {
+                        tracing::debug!(bps, frames, lost, "bitrate changed");
+                        control.bitrate.store(bps, Ordering::Relaxed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    let result: Result<()> = tokio::select! {
+        r = control_loop => r,
+        _ = conn.closed() => Ok(()),
+    };
+    control.stop.store(true, Ordering::Relaxed);
+    // A closed control stream is the normal way a viewer leaves.
+    match result {
+        Err(e) if is_closed(&e) => Ok(()),
+        other => other,
+    }
+}
+
+/// Adaptive bitrate: back off on loss, probe upwards after a clean stretch.
+struct Abr {
+    current: u32,
+    min: u32,
+    max: u32,
+    clean_seconds: u32,
+}
+
+impl Abr {
+    fn update(&mut self, frames: u32, lost: u32) -> Option<u32> {
+        let total = frames + lost;
+        if total == 0 {
+            return None;
+        }
+        let before = self.current;
+        if lost as f32 / total as f32 > 0.02 {
+            self.current = ((self.current as f32 * 0.8) as u32).max(self.min);
+            self.clean_seconds = 0;
+        } else {
+            self.clean_seconds += 1;
+            if self.clean_seconds >= 5 {
+                self.current = ((self.current as f32 * 1.1) as u32).min(self.max);
+                self.clean_seconds = 0;
+            }
+        }
+        (self.current != before).then_some(self.current)
+    }
+}
+
+fn is_closed(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    s.contains("closed") || s.contains("finished") || s.contains("reset") || s.contains("lost")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abr_backs_off_and_recovers() {
+        let mut abr = Abr { current: 20_000_000, min: 5_000_000, max: 50_000_000, clean_seconds: 0 };
+        assert_eq!(abr.update(50, 10), Some(16_000_000));
+        for _ in 0..4 {
+            assert_eq!(abr.update(60, 0), None);
+        }
+        assert_eq!(abr.update(60, 0), Some(17_600_000));
+        for _ in 0..20 {
+            abr.update(1, 9);
+        }
+        assert_eq!(abr.current, 5_000_000);
+    }
+}

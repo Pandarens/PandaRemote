@@ -16,11 +16,11 @@ use crate::{
     client::{self, viewer},
     config::{self, HostConfig, JournalEntry, SavedHost},
     host::Host,
-    proto::{ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, SessionKind},
+    proto::{ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, Profile},
     ticket::Ticket,
 };
 
-pub fn run(rt: Runtime, initial: Option<Ticket>) -> Result<()> {
+pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Panda Remote")
@@ -76,6 +76,7 @@ struct ThisPc {
 
 struct DesktopView {
     name: String,
+    profile: Profile,
     shared: Arc<viewer::Shared>,
     out: tmpsc::UnboundedSender<ClientMsg>,
     task: JoinHandle<()>,
@@ -86,7 +87,7 @@ struct DesktopView {
 }
 
 impl App {
-    fn new(ctx: egui::Context, rt: Runtime, initial: Option<Ticket>) -> Self {
+    fn new(ctx: egui::Context, rt: Runtime, initial: Option<(Ticket, Profile)>) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut app = App {
             rt,
@@ -109,8 +110,8 @@ impl App {
             },
             desktop: None,
         };
-        if let Some(t) = initial {
-            app.start_desktop("Удалённый ПК".into(), t.encode());
+        if let Some((t, profile)) = initial {
+            app.start_session("Удалённый ПК".into(), t.encode(), profile);
         }
         app
     }
@@ -158,7 +159,7 @@ impl App {
 
     // ---------- actions ----------
 
-    fn start_desktop(&mut self, name: String, ticket_str: String) {
+    fn start_session(&mut self, name: String, ticket_str: String, profile: Profile) {
         let ticket = match Ticket::decode(&ticket_str) {
             Ok(t) => t,
             Err(e) => {
@@ -175,7 +176,7 @@ impl App {
         let (shared2, out_tx2) = (shared.clone(), out_tx.clone());
         let task = self.rt.spawn(async move {
             let res = async {
-                let session = client::connect(&ticket, SessionKind::Desktop).await?;
+                let session = client::connect(&ticket, profile).await?;
                 send(UiEvent::Connected { ticket: ticket_str });
                 viewer::run(session, shared2, out_tx2, out_rx, repaint).await
             }
@@ -185,6 +186,7 @@ impl App {
         self.message = None;
         self.desktop = Some(DesktopView {
             name,
+            profile,
             shared,
             out: out_tx,
             task,
@@ -240,6 +242,9 @@ impl App {
                 if ui.button("🖥 Рабочий стол").clicked() {
                     action = Some((i, "desktop"));
                 }
+                if ui.button("🎮 Игра").clicked() {
+                    action = Some((i, "game"));
+                }
                 if ui.button("🗑").on_hover_text("Удалить").clicked() {
                     action = Some((i, "delete"));
                 }
@@ -249,7 +254,8 @@ impl App {
         if let Some((i, what)) = action {
             let h = self.hosts[i].clone();
             match what {
-                "desktop" => self.start_desktop(h.name, h.ticket),
+                "desktop" => self.start_session(h.name, h.ticket, Profile::Desktop),
+                "game" => self.start_session(h.name, h.ticket, Profile::Game),
                 _ => {
                     self.hosts.remove(i);
                     let _ = config::save_hosts(&self.hosts);
