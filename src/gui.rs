@@ -1,4 +1,5 @@
-//! Desktop GUI (eframe/egui): saved hosts, remote-desktop viewer, "this PC" host panel.
+//! Desktop GUI (eframe/egui): computers list with online status, session window with drawing tools,
+//! "this PC" panel (access, ticket, service, settings, journal).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,6 +20,7 @@ use crate::{
     client::{self, gamepad, viewer},
     config::{self, HostConfig, JournalEntry, SavedHost},
     host::Host,
+    media::annotate::{self, DrawEvent, Ink},
     proto::{ClientMsg, InputEvent, KeyCode, Modifiers, MouseButton, Profile},
     ticket::Ticket,
     yuv_render::{self, PendingFrame},
@@ -26,7 +28,10 @@ use crate::{
 
 pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>, minimized: bool) -> Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Panda Remote").with_inner_size([1100.0, 720.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Panda Remote")
+            .with_inner_size([820.0, 560.0])
+            .with_min_inner_size([620.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -68,6 +73,10 @@ struct App {
     hosts: Vec<SavedHost>,
     new_name: String,
     new_ticket: String,
+    /// The "add computer" form is open.
+    adding: bool,
+    /// Host being renamed: (index, edited name).
+    renaming: Option<(usize, String)>,
 
     this_pc: ThisPc,
     desktop: Option<DesktopView>,
@@ -117,6 +126,14 @@ struct DesktopView {
     game: Option<GameInput>,
     /// Physical-key keyboard used while the host shows its lock screen.
     secure_keys: ScancodeKeyboard,
+    tool: Tool,
+    /// Pen colour (index into `annotate::COLORS`).
+    color: usize,
+    /// Local copy of what is drawn on the remote screen.
+    ink: Ink,
+    stroke_seq: u32,
+    /// Stroke being drawn while the button is held.
+    drawing: Option<u32>,
 }
 
 /// Game-profile input: captured pointer, raw mouse deltas, keys as scancodes, gamepad forwarding.
@@ -188,6 +205,7 @@ impl App {
         minimized: bool,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
+        apply_style(&ctx);
         if minimized {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
@@ -206,6 +224,8 @@ impl App {
             hosts: config::load_hosts(),
             new_name: String::new(),
             new_ticket: String::new(),
+            adding: false,
+            renaming: None,
             this_pc: ThisPc {
                 host: None,
                 starting: false,
@@ -359,6 +379,11 @@ impl App {
             fullscreen: false,
             game,
             secure_keys: ScancodeKeyboard::default(),
+            tool: Tool::Control,
+            color: 0,
+            ink: Ink::default(),
+            stroke_seq: 0,
+            drawing: None,
         });
     }
 
@@ -400,56 +425,103 @@ impl App {
 
     // ---------- views ----------
 
-    fn hosts_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Мои компьютеры");
-        ui.add_space(6.0);
-
-        let mut action: Option<(usize, &'static str)> = None;
-        if self.hosts.is_empty() {
-            ui.label("Пока пусто. Запустите хост на удалённом ПК (вкладка «Этот компьютер»), скопируйте билет и добавьте его ниже.");
-        }
+    fn computers_tab(&mut self, ui: &mut egui::Ui) {
         *self.ping_targets.lock().unwrap() = self.host_ids();
         let presence = self.presence.lock().unwrap().clone();
         let state = |h: &SavedHost| Ticket::decode(&h.ticket).ok().and_then(|t| presence.get(&t.host_id).cloned());
+        let online = self.hosts.iter().filter(|h| matches!(state(h), Some(Presence::Online(_)))).count();
+
+        ui.horizontal(|ui| {
+            ui.heading("Компьютеры");
+            if !self.hosts.is_empty() {
+                ui.label(egui::RichText::new(format!("{online} из {} в сети", self.hosts.len())).weak());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(primary_button("+ Добавить")).clicked() {
+                    self.adding ^= true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        if self.adding {
+            self.add_form(ui);
+            ui.add_space(6.0);
+        }
+
+        if self.hosts.is_empty() && !self.adding {
+            card(ui, |ui| {
+                ui.label(egui::RichText::new("Как подключиться к своему компьютеру").strong());
+                ui.add_space(4.0);
+                ui.label("1. На том компьютере откройте Panda → «Этот ПК» → «Разрешить доступ».");
+                ui.label("2. Нажмите «Копировать билет» и перешлите его себе (это как пароль).");
+                ui.label("3. Здесь нажмите «+ Добавить» и вставьте билет.");
+            });
+            return;
+        }
+
         // Online computers first, otherwise in the saved order.
         let mut order: Vec<usize> = (0..self.hosts.len()).collect();
         order.sort_by_key(|&i| !matches!(state(&self.hosts[i]), Some(Presence::Online(_))));
-        egui::Grid::new("hosts").striped(true).spacing([16.0, 8.0]).show(ui, |ui| {
+        let mut action: Option<(usize, &'static str)> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
             for i in order {
                 let h = &self.hosts[i];
-                match state(h) {
-                    Some(Presence::Online(route)) => {
-                        ui.colored_label(Color32::from_rgb(80, 200, 120), "●").on_hover_text(&route);
-                    }
-                    Some(Presence::Offline) => {
-                        ui.colored_label(Color32::GRAY, "●").on_hover_text("не в сети");
-                    }
-                    None => {
-                        ui.colored_label(Color32::YELLOW, "●").on_hover_text("проверка…");
-                    }
-                }
-                ui.label(egui::RichText::new(&h.name).strong());
-                let id = Ticket::decode(&h.ticket).map(|t| t.host_id.fmt_short().to_string()).unwrap_or_default();
-                ui.label(egui::RichText::new(id).monospace().weak());
-                ui.label(match state(h) {
-                    Some(Presence::Online(route)) => format!("в сети · {route}"),
-                    Some(Presence::Offline) => h
-                        .last_connected
-                        .as_deref()
-                        .map(|t| format!("не в сети · был: {}", &t[..16.min(t.len())]))
-                        .unwrap_or_else(|| "не в сети".into()),
-                    None => "проверка…".into(),
+                let st = state(h);
+                card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (color, line) = match &st {
+                            Some(Presence::Online(route)) => (GREEN, format!("в сети · {route}")),
+                            Some(Presence::Offline) => (
+                                Color32::GRAY,
+                                h.last_connected
+                                    .as_deref()
+                                    .map(|t| format!("не в сети · был {}", t[..16.min(t.len())].replace('T', " ")))
+                                    .unwrap_or_else(|| "не в сети".into()),
+                            ),
+                            None => (YELLOW, "проверка…".into()),
+                        };
+                        status_dot(ui, color);
+                        ui.vertical(|ui| {
+                            if let Some((idx, name)) = self.renaming.as_mut().filter(|(idx, _)| *idx == i) {
+                                let resp = ui.add(egui::TextEdit::singleline(name).desired_width(200.0));
+                                if resp.lost_focus() {
+                                    action = Some((*idx, "rename_done"));
+                                }
+                                resp.request_focus();
+                            } else {
+                                ui.label(egui::RichText::new(&h.name).strong().size(15.0));
+                            }
+                            ui.label(egui::RichText::new(line).small().weak());
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.menu_button("⋯", |ui| {
+                                if ui.button("✏ Переименовать").clicked() {
+                                    action = Some((i, "rename"));
+                                    ui.close();
+                                }
+                                if ui.button("📋 Копировать билет").clicked() {
+                                    ui.ctx().copy_text(h.ticket.clone());
+                                    ui.close();
+                                }
+                                if ui.button("🗑 Удалить").clicked() {
+                                    action = Some((i, "delete"));
+                                    ui.close();
+                                }
+                            });
+                            if ui
+                                .button("🎮")
+                                .on_hover_text("Игровой режим: 60 к/с, захват мыши, геймпад, звук")
+                                .clicked()
+                            {
+                                action = Some((i, "game"));
+                            }
+                            if ui.add(primary_button("Подключиться")).clicked() {
+                                action = Some((i, "desktop"));
+                            }
+                        });
+                    });
                 });
-                if ui.button("🖥 Рабочий стол").clicked() {
-                    action = Some((i, "desktop"));
-                }
-                if ui.button("🎮 Игра").clicked() {
-                    action = Some((i, "game"));
-                }
-                if ui.button("🗑").on_hover_text("Удалить").clicked() {
-                    action = Some((i, "delete"));
-                }
-                ui.end_row();
             }
         });
         if let Some((i, what)) = action {
@@ -457,103 +529,254 @@ impl App {
             match what {
                 "desktop" => self.start_session(h.name, h.ticket, Profile::Desktop),
                 "game" => self.start_session(h.name, h.ticket, Profile::Game),
+                "rename" => self.renaming = Some((i, h.name)),
+                "rename_done" => {
+                    if let Some((_, name)) = self.renaming.take()
+                        && !name.trim().is_empty()
+                    {
+                        self.hosts[i].name = name.trim().to_string();
+                        let _ = config::save_hosts(&self.hosts);
+                    }
+                }
                 _ => {
                     self.hosts.remove(i);
                     let _ = config::save_hosts(&self.hosts);
                 }
             }
         }
+    }
 
-        ui.add_space(16.0);
-        ui.separator();
-        ui.label(egui::RichText::new("Добавить компьютер").strong());
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.new_name).hint_text("Название").desired_width(160.0));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.new_ticket)
-                    .hint_text("Билет panda1…")
-                    .desired_width(480.0)
-                    .password(true),
-            );
-            if ui.button("Добавить").clicked() {
-                match Ticket::decode(&self.new_ticket) {
-                    Ok(t) => {
-                        let name = if self.new_name.trim().is_empty() {
-                            t.host_id.fmt_short().to_string()
-                        } else {
-                            self.new_name.trim().to_string()
-                        };
-                        self.hosts
-                            .retain(|h| Ticket::decode(&h.ticket).map(|x| x.host_id != t.host_id).unwrap_or(true));
-                        self.hosts.push(SavedHost { name, ticket: t.encode(), last_connected: None });
-                        let _ = config::save_hosts(&self.hosts);
-                        self.new_name.clear();
-                        self.new_ticket.clear();
+    fn add_form(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.label(egui::RichText::new("Новый компьютер").strong());
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_name)
+                        .hint_text("Название, например «Дом»")
+                        .desired_width(170.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_ticket)
+                        .hint_text("Билет panda1…")
+                        .desired_width(ui.available_width() - 170.0)
+                        .password(true),
+                );
+                if ui.add(primary_button("Добавить")).clicked() {
+                    match Ticket::decode(&self.new_ticket) {
+                        Ok(t) => {
+                            let name = if self.new_name.trim().is_empty() {
+                                t.host_id.fmt_short().to_string()
+                            } else {
+                                self.new_name.trim().to_string()
+                            };
+                            self.hosts
+                                .retain(|h| Ticket::decode(&h.ticket).map(|x| x.host_id != t.host_id).unwrap_or(true));
+                            self.hosts.push(SavedHost { name, ticket: t.encode(), last_connected: None });
+                            let _ = config::save_hosts(&self.hosts);
+                            self.new_name.clear();
+                            self.new_ticket.clear();
+                            self.adding = false;
+                        }
+                        Err(_) => {
+                            self.message = Some((true, "Это не похоже на билет Panda: он начинается с panda1".into()))
+                        }
                     }
-                    Err(e) => self.message = Some((true, format!("{e:#}"))),
+                }
+                if ui.button("Отмена").clicked() {
+                    self.adding = false;
+                }
+            });
+        });
+    }
+
+    /// The ticket row: masked, show/copy.
+    fn ticket_row(&mut self, ui: &mut egui::Ui, ticket: &str) {
+        ui.horizontal(|ui| {
+            let shown = if self.this_pc.show_ticket {
+                ticket.to_string()
+            } else {
+                "••••••••••••••••".into()
+            };
+            ui.label(egui::RichText::new(shown).monospace());
+            if ui.small_button(if self.this_pc.show_ticket { "Скрыть" } else { "Показать" }).clicked() {
+                self.this_pc.show_ticket ^= true;
+            }
+            if ui.add(primary_button("📋 Копировать билет")).clicked() {
+                ui.ctx().copy_text(ticket.to_string());
+                self.message = Some((false, "Билет скопирован. Он работает как пароль — не публикуйте его.".into()));
+            }
+        });
+    }
+
+    fn this_pc_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Этот ПК");
+        ui.add_space(4.0);
+        // With the Windows service installed it is the host; the in-app host would fight it over the key.
+        let service_mode = config::service_installed();
+
+        card(ui, |ui| {
+            if service_mode {
+                self.service_status(ui);
+            } else {
+                let (text, color) = match (&self.this_pc.host, self.this_pc.starting, self.this_pc.online) {
+                    (_, true, _) | (Some(_), _, false) => ("Включается…", YELLOW),
+                    (Some(_), _, true) => ("Доступ открыт: к этому ПК можно подключиться откуда угодно", GREEN),
+                    (None, _, _) => ("Доступ закрыт", Color32::GRAY),
+                };
+                ui.horizontal(|ui| {
+                    status_dot(ui, color);
+                    ui.label(egui::RichText::new(text).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.this_pc.host.is_none() {
+                            if ui.add_enabled(!self.this_pc.starting, primary_button("Разрешить доступ")).clicked()
+                            {
+                                self.start_host();
+                            }
+                        } else if ui.button("Закрыть доступ").clicked() {
+                            self.stop_host();
+                        }
+                    });
+                });
+            }
+        });
+
+        // Ticket: from the running in-app host, or from the service's files (admin-only).
+        let ticket = if service_mode {
+            config::host_key()
+                .and_then(|k| Ok(Ticket { host_id: k.public(), secret: HostConfig::load_or_create()?.access_secret }))
+                .ok()
+                .map(|t| t.encode())
+        } else {
+            self.this_pc.host.as_ref().map(|h| h.ticket.encode())
+        };
+        if let Some(ticket) = ticket {
+            card(ui, |ui| {
+                ui.label(egui::RichText::new("Билет для подключения").strong());
+                self.ticket_row(ui, &ticket);
+                if !service_mode {
+                    self.rotate_secret_row(ui);
+                }
+            });
+        } else if service_mode {
+            card(ui, |ui| {
+                ui.label("Билет службы виден только администраторам: panda-rc ticket в терминале администратора.");
+            });
+        }
+
+        card(ui, |ui| {
+            ui.label(egui::RichText::new("Настройки").strong());
+            if ui.checkbox(&mut self.settings.autostart, "Запускать Panda вместе с Windows (свёрнутой)").changed()
+            {
+                let _ = config::save_settings(&self.settings);
+                if let Err(e) = autostart::set(self.settings.autostart) {
+                    self.message = Some((true, format!("Автозапуск: {e:#}")));
+                }
+            }
+            #[cfg(windows)]
+            if !service_mode {
+                ui.horizontal(|ui| {
+                    ui.label("🔒 Доступ на экране блокировки и после перезагрузки:");
+                    let label = if self.this_pc.service_busy {
+                        "Установка…"
+                    } else {
+                        "Установить службу…"
+                    };
+                    if ui.add_enabled(!self.this_pc.service_busy, egui::Button::new(label)).clicked() {
+                        self.service_action(true);
+                    }
+                });
+            }
+        });
+
+        egui::CollapsingHeader::new("Журнал подключений").default_open(false).show(ui, |ui| {
+            if self.this_pc.journal_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+                self.this_pc.journal = config::read_journal(50);
+                self.this_pc.journal_at = Some(Instant::now());
+            }
+            if self.this_pc.journal.is_empty() {
+                ui.label(egui::RichText::new("Подключений ещё не было").weak());
+            }
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                egui::Grid::new("journal").striped(true).spacing([10.0, 3.0]).show(ui, |ui| {
+                    for e in &self.this_pc.journal {
+                        ui.label(egui::RichText::new(e.ts.replace('T', " ").trim_end_matches('Z')).small());
+                        let ev = match e.event.as_str() {
+                            "connected" => "✅ вход",
+                            "disconnected" => "⏹ выход",
+                            "auth_failed" => "⛔ отказ",
+                            other => other,
+                        };
+                        ui.label(egui::RichText::new(ev).small());
+                        ui.label(egui::RichText::new(&e.client_name).small());
+                        ui.label(egui::RichText::new(&e.detail).small().weak());
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        ui.ctx().request_repaint_after(Duration::from_secs(2));
+    }
+
+    fn rotate_secret_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if !self.this_pc.confirm_rotate {
+                if ui.small_button("Сменить билет…").on_hover_text("Если билет попал не в те руки").clicked()
+                {
+                    self.this_pc.confirm_rotate = true;
+                }
+            } else {
+                ui.label(egui::RichText::new("Все выданные билеты перестанут работать.").small());
+                if ui.small_button("Сменить").clicked() {
+                    self.this_pc.confirm_rotate = false;
+                    match HostConfig::load_or_create().and_then(|mut c| c.rotate_secret()) {
+                        Ok(()) => {
+                            self.stop_host();
+                            self.start_host();
+                            self.message = Some((false, "Билет обновлён — скопируйте новый.".into()));
+                        }
+                        Err(e) => self.message = Some((true, format!("{e:#}"))),
+                    }
+                }
+                if ui.small_button("Отмена").clicked() {
+                    self.this_pc.confirm_rotate = false;
                 }
             }
         });
     }
 
-    fn service_panel(&mut self, ui: &mut egui::Ui) {
+    fn service_status(&mut self, ui: &mut egui::Ui) {
         #[cfg(windows)]
         let running = crate::service::status() == Some(windows_service::service::ServiceState::Running);
         #[cfg(not(windows))]
         let running = false;
         ui.horizontal(|ui| {
             if running {
-                ui.colored_label(Color32::from_rgb(80, 200, 120), "●");
-                ui.label("Служба Windows работает: ПК доступен всегда, в том числе на экране блокировки и до входа в систему");
+                status_dot(ui, GREEN);
+                ui.label(egui::RichText::new("Доступ открыт всегда (служба Windows)").strong()).on_hover_text(
+                    "Работает и на экране блокировки, в окнах UAC и после перезагрузки до входа в систему",
+                );
             } else {
-                ui.colored_label(Color32::GRAY, "●");
-                ui.label("Служба Windows установлена, но не запущена");
+                status_dot(ui, Color32::GRAY);
+                ui.label(egui::RichText::new("Служба установлена, но не запущена").strong());
             }
-        });
-        let ticket = config::host_key()
-            .and_then(|k| Ok(Ticket { host_id: k.public(), secret: HostConfig::load_or_create()?.access_secret }));
-        match ticket {
-            Ok(t) => {
-                ui.add_space(8.0);
-                ui.label(format!("ID компьютера (постоянный адрес): {}", t.host_id));
-                ui.horizontal(|ui| {
-                    ui.label("Билет:");
-                    let ticket = t.encode();
-                    if self.this_pc.show_ticket {
-                        ui.label(egui::RichText::new(&ticket).monospace());
-                    } else {
-                        ui.label("••••••••••••");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let busy = self.this_pc.service_busy;
+                ui.menu_button("Служба…", |ui| {
+                    // Reinstalling over the running service upgrades it to this version of the program.
+                    if ui.add_enabled(!busy, egui::Button::new("Обновить до этой версии…")).clicked()
+                    {
+                        self.service_action(true);
+                        ui.close();
                     }
-                    if ui.button(if self.this_pc.show_ticket { "Скрыть" } else { "Показать" }).clicked() {
-                        self.this_pc.show_ticket ^= true;
-                    }
-                    if ui.button("📋 Копировать").clicked() {
-                        ui.ctx().copy_text(ticket);
-                        self.message = Some((false, "Билет скопирован. Храните его как пароль.".into()));
+                    if ui.add_enabled(!busy, egui::Button::new("Удалить службу…")).clicked() {
+                        self.service_action(false);
+                        ui.close();
                     }
                 });
-            }
-            // The service's files are readable by administrators only.
-            Err(_) => {
-                ui.label(
-                    "Билет службы доступен администраторам: panda-rc ticket в терминале администратора. Журнал — ниже.",
-                );
-            }
-        }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let busy = self.this_pc.service_busy;
-            // Reinstalling over the running service upgrades it to this version of the program.
-            if ui
-                .add_enabled(!busy, egui::Button::new("Обновить службу…"))
-                .on_hover_text("Перезапустить службу с этой версией программы")
-                .clicked()
-            {
-                self.service_action(true);
-            }
-            if ui.add_enabled(!busy, egui::Button::new("Удалить службу…")).clicked() {
-                self.service_action(false);
-            }
+                if busy {
+                    ui.spinner();
+                }
+            });
         });
         ui.ctx().request_repaint_after(Duration::from_secs(2));
     }
@@ -577,178 +800,78 @@ impl App {
         let _ = install;
     }
 
-    fn this_pc_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Этот компьютер");
-        ui.add_space(6.0);
-        if ui.checkbox(&mut self.settings.autostart, "Запускать Panda при входе в Windows (свёрнутой)").changed()
-        {
-            let _ = config::save_settings(&self.settings);
-            if let Err(e) = autostart::set(self.settings.autostart) {
-                self.message = Some((true, format!("Автозапуск: {e:#}")));
-            }
-        }
-        ui.add_space(6.0);
-
-        // With the Windows service installed it is the host; the in-app host would fight it over the key.
-        let service_mode = config::service_installed();
-        if service_mode {
-            self.service_panel(ui);
-        }
-        if !service_mode {
-            let (status, color) = match (&self.this_pc.host, self.this_pc.starting, self.this_pc.online) {
-                (_, true, _) => ("Запуск…", Color32::YELLOW),
-                (Some(_), _, true) => {
-                    ("В сети — к этому ПК можно подключиться откуда угодно", Color32::from_rgb(80, 200, 120))
-                }
-                (Some(_), _, false) => ("Подключение к сети…", Color32::YELLOW),
-                (None, _, _) => ("Хост выключен", Color32::GRAY),
-            };
+    fn session_toolbar(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(view) = self.desktop.as_mut() else { return false };
+        let mut disconnect = false;
+        egui::Panel::top("session_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.colored_label(color, "●");
-                ui.label(status);
-            });
-            ui.horizontal(|ui| {
-                if self.this_pc.host.is_none() {
-                    if ui.add_enabled(!self.this_pc.starting, egui::Button::new("▶ Разрешить подключения")).clicked()
-                    {
-                        self.start_host();
-                    }
-                } else if ui.button("■ Остановить").clicked() {
-                    self.stop_host();
-                }
-            });
+                let icon = if view.profile == Profile::Game { "🎮" } else { "🖥" };
+                let status = view.shared.status.lock().unwrap().clone();
+                let connected = view.frame_size.is_some();
+                status_dot(ui, if connected { GREEN } else { YELLOW });
+                ui.label(egui::RichText::new(format!("{icon} {}", view.name)).strong()).on_hover_text(&status);
+                ui.label(egui::RichText::new(short_status(&status)).small().weak()).on_hover_text(&status);
 
-            if let Some(host) = &self.this_pc.host {
-                ui.add_space(8.0);
-                ui.label(format!("ID компьютера (постоянный адрес): {}", host.ticket.host_id));
-                ui.horizontal(|ui| {
-                    ui.label("Билет:");
-                    let ticket = host.ticket.encode();
-                    if self.this_pc.show_ticket {
-                        ui.label(egui::RichText::new(&ticket).monospace());
-                    } else {
-                        ui.label("••••••••••••");
+                ui.separator();
+                for (tool, label, tip) in [
+                    (Tool::Control, "🖱", "Управление удалённым ПК"),
+                    (Tool::Pen, "✏", "Рисовать: линии видны на удалённом экране и исчезают через секунду"),
+                    (Tool::Laser, "🔦", "Указка: красная точка на удалённом экране"),
+                ] {
+                    if ui.selectable_label(view.tool == tool, label).on_hover_text(tip).clicked() {
+                        view.tool = tool;
                     }
-                    if ui.button(if self.this_pc.show_ticket { "Скрыть" } else { "Показать" }).clicked() {
-                        self.this_pc.show_ticket ^= true;
+                }
+                if view.tool == Tool::Pen {
+                    for (i, c) in annotate::COLORS.iter().enumerate() {
+                        let color = Color32::from_rgb(c[0], c[1], c[2]);
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
+                        ui.painter().circle_filled(rect.center(), if view.color == i { 7.0 } else { 5.0 }, color);
+                        if resp.clicked() {
+                            view.color = i;
+                        }
                     }
-                    if ui.button("📋 Копировать").clicked() {
-                        ui.ctx().copy_text(ticket);
-                        self.message = Some((false, "Билет скопирован. Храните его как пароль.".into()));
+                }
+                if view.tool != Tool::Control && ui.button("🧹").on_hover_text("Стереть всё").clicked() {
+                    view.ink.apply(&DrawEvent::Clear, Instant::now());
+                    let _ = view.out.send(ClientMsg::Draw(DrawEvent::Clear));
+                }
+
+                if view.shared.secure_desktop.load(Ordering::Relaxed) {
+                    ui.separator();
+                    ui.label(egui::RichText::new("🔒 экран блокировки").color(ACCENT)).on_hover_text(
+                        "Клавиши передаются как физические — пароль вводится как на обычной клавиатуре. Сначала кликните в поле пароля.",
+                    );
+                }
+                if let Some(notice) = view.shared.notice.lock().unwrap().as_deref() {
+                    ui.label(egui::RichText::new("🎮 нет геймпада").color(YELLOW)).on_hover_text(notice);
+                }
+                if let Some(g) = &view.game {
+                    let hint = if g.captured { "Ctrl+Alt+Shift+Q — отпустить мышь" } else { "клик по картинке — захват мыши" };
+                    ui.label(egui::RichText::new(hint).small().weak());
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✕ Отключиться").clicked() {
+                        disconnect = true;
+                    }
+                    if ui.button("Во весь экран").on_hover_text("F11 — выйти").clicked() {
+                        view.fullscreen = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                     }
                 });
-                ui.horizontal(|ui| {
-                    if !self.this_pc.confirm_rotate {
-                        if ui.button("Сменить секрет…").clicked() {
-                            self.this_pc.confirm_rotate = true;
-                        }
-                    } else {
-                        ui.label("Все выданные билеты перестанут работать. Продолжить?");
-                        if ui.button("Да, сменить").clicked() {
-                            self.this_pc.confirm_rotate = false;
-                            let res = HostConfig::load_or_create().and_then(|mut c| c.rotate_secret());
-                            match res {
-                                Ok(()) => {
-                                    self.stop_host();
-                                    self.start_host();
-                                    self.message = Some((false, "Секрет обновлён, скопируйте новый билет.".into()));
-                                }
-                                Err(e) => self.message = Some((true, format!("{e:#}"))),
-                            }
-                        }
-                        if ui.button("Отмена").clicked() {
-                            self.this_pc.confirm_rotate = false;
-                        }
-                    }
-                });
-            }
-
-            #[cfg(windows)]
-            {
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("🔒 Доступ всегда").strong());
-                ui.label("Служба Windows: ПК доступен на экране блокировки, в окнах UAC и после перезагрузки до входа в систему.");
-                let label = if self.this_pc.service_busy {
-                    "Установка…"
-                } else {
-                    "Установить службу…"
-                };
-                if ui.add_enabled(!self.this_pc.service_busy, egui::Button::new(label)).clicked() {
-                    self.service_action(true);
-                }
-            }
-        }
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(egui::RichText::new("Журнал подключений").strong());
-        if self.this_pc.journal_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
-            self.this_pc.journal = config::read_journal(50);
-            self.this_pc.journal_at = Some(Instant::now());
-        }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("journal").striped(true).spacing([12.0, 4.0]).show(ui, |ui| {
-                for e in &self.this_pc.journal {
-                    ui.label(e.ts.replace('T', " ").trim_end_matches('Z'));
-                    let ev = match e.event.as_str() {
-                        "connected" => "✅ подключение",
-                        "disconnected" => "⏹ отключение",
-                        "auth_failed" => "⛔ отказ",
-                        other => other,
-                    };
-                    ui.label(ev);
-                    ui.label(&e.client_name);
-                    ui.label(egui::RichText::new(&e.client_id[..10.min(e.client_id.len())]).monospace().weak());
-                    ui.label(&e.detail);
-                    ui.end_row();
-                }
             });
         });
-        ui.ctx().request_repaint_after(Duration::from_secs(2));
+        disconnect
     }
 
     fn desktop_view(&mut self, ui: &mut egui::Ui) {
         let gpu_video = self.gpu_video;
+        let fullscreen = self.desktop.as_ref().is_some_and(|v| v.fullscreen);
+        let disconnect = if fullscreen { false } else { self.session_toolbar(ui) };
         let Some(view) = self.desktop.as_mut() else {
             return;
         };
-        let mut disconnect = false;
-
-        if !view.fullscreen {
-            egui::Panel::top("session_bar").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let icon = if view.profile == Profile::Game { "🎮" } else { "🖥" };
-                    ui.label(egui::RichText::new(format!("{icon} {}", view.name)).strong());
-                    ui.label(view.shared.status.lock().unwrap().clone());
-                    if let Some(g) = &view.game {
-                        let hint = if g.captured {
-                            "мышь захвачена · Ctrl+Alt+Shift+Q — отпустить"
-                        } else {
-                            "кликните по картинке, чтобы захватить мышь"
-                        };
-                        ui.label(egui::RichText::new(hint).weak());
-                    }
-                    if view.shared.secure_desktop.load(Ordering::Relaxed) {
-                        ui.colored_label(
-                            Color32::from_rgb(120, 170, 255),
-                            "🔒 удалённый ПК на экране блокировки — клавиши передаются как физические",
-                        );
-                    }
-                    if let Some(notice) = view.shared.notice.lock().unwrap().as_deref() {
-                        ui.colored_label(Color32::from_rgb(230, 170, 60), format!("🎮 геймпад: {notice}"));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Отключиться").clicked() {
-                            disconnect = true;
-                        }
-                        if ui.button("Полный экран (F11)").clicked() {
-                            view.fullscreen = true;
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-                        }
-                    });
-                });
-            });
-        }
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
             ui.painter().rect_filled(ui.max_rect(), 0.0, Color32::BLACK);
@@ -765,7 +888,12 @@ impl App {
                 }
             }
             let Some((fw, fh)) = view.frame_size else {
-                ui.centered_and_justified(|ui| ui.label(view.shared.status.lock().unwrap().clone()));
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.label(view.shared.status.lock().unwrap().clone());
+                    })
+                });
                 return;
             };
             let avail = ui.max_rect();
@@ -778,58 +906,36 @@ impl App {
                 ui.painter().image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             }
             let resp = ui.allocate_rect(rect, Sense::click_and_drag());
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-            }
             let (events, mods, focused) = ui.input(|i| (i.events.clone(), i.modifiers, i.focused));
-            if let Some(g) = view.game.as_mut() {
-                if !g.captured && resp.clicked() {
-                    g.captured = true;
-                    g.keys.mods = egui::Modifiers::default();
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
-                    return;
+
+            // Drawing tools: the pointer draws instead of controlling the remote mouse.
+            if view.tool != Tool::Control && view.game.as_ref().is_none_or(|g| !g.captured) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                draw_input(view, &events, rect);
+            } else {
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
                 }
-                if g.captured {
-                    let release = !focused
-                        || game_input(g, &events, mods, &view.out, &mut view.wheel, &mut view.fullscreen, ui.ctx());
-                    if release {
-                        release_capture(g, &view.out, ui.ctx());
+                if let Some(g) = view.game.as_mut() {
+                    if !g.captured && resp.clicked() {
+                        g.captured = true;
+                        g.keys.mods = egui::Modifiers::default();
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+                        return;
                     }
-                    return;
-                }
-            }
-            let secure = view.shared.secure_desktop.load(Ordering::Relaxed);
-            let out = &view.out;
-            let send = |ev: InputEvent| {
-                let _ = out.send(ClientMsg::Input(ev));
-            };
-            if secure {
-                view.secure_keys.sync_modifiers(mods, &send);
-            } else if !view.secure_keys.pressed.is_empty() {
-                view.secure_keys.release_all(&send);
-            }
-            for ev in events {
-                if let egui::Event::Key { key: egui::Key::F11, pressed: true, .. } = ev {
-                    view.fullscreen ^= true;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(view.fullscreen));
-                    continue;
-                }
-                // Lock screen: keys go as physical presses; text and clipboard events would not register there.
-                if secure {
-                    match &ev {
-                        egui::Event::Key { key, physical_key, pressed, .. } => {
-                            view.secure_keys.key(physical_key.unwrap_or(*key), *pressed, &send);
-                            continue;
+                    if g.captured {
+                        let release = !focused
+                            || game_input(g, &events, mods, &view.out, &mut view.wheel, &mut view.fullscreen, ui.ctx());
+                        if release {
+                            release_capture(g, &view.out, ui.ctx());
                         }
-                        egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut => continue,
-                        _ => {}
+                        return;
                     }
                 }
-                for msg in translate(&ev, rect, &mut view.last_pos, &mut view.wheel) {
-                    let _ = view.out.send(ClientMsg::Input(msg));
-                }
+                remote_input(view, &events, mods, rect, ui.ctx());
             }
+            paint_ink(ui.painter(), &mut view.ink, rect);
         });
 
         if disconnect && let Some(mut d) = self.desktop.take() {
@@ -854,28 +960,226 @@ impl eframe::App for App {
         }
 
         egui::Panel::top("tabs").show(ui, |ui| {
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("🐼 Panda Remote");
-                ui.add_space(16.0);
-                ui.selectable_value(&mut self.tab, Tab::Hosts, "Подключения");
-                ui.selectable_value(&mut self.tab, Tab::ThisPc, "Этот компьютер");
+                ui.label(egui::RichText::new("🐼 Panda").strong().size(17.0));
+                ui.add_space(12.0);
+                ui.selectable_value(&mut self.tab, Tab::Hosts, "💻 Компьютеры");
+                ui.selectable_value(&mut self.tab, Tab::ThisPc, "🏠 Этот ПК");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Where this PC stands, one glance from any tab.
+                    let (text, color) = if config::service_installed() {
+                        ("доступ открыт всегда", GREEN)
+                    } else if self.this_pc.online {
+                        ("доступ открыт", GREEN)
+                    } else {
+                        ("доступ закрыт", Color32::GRAY)
+                    };
+                    if ui.add(egui::Button::new(egui::RichText::new(text).small()).frame(false)).clicked() {
+                        self.tab = Tab::ThisPc;
+                    }
+                    status_dot(ui, color);
+                    ui.label(egui::RichText::new("Этот ПК:").small().weak());
+                });
             });
+            ui.add_space(2.0);
         });
         if let Some((is_err, text)) = self.message.clone() {
             egui::Panel::bottom("message").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let color = if is_err { Color32::from_rgb(230, 90, 90) } else { Color32::from_rgb(80, 200, 120) };
-                    ui.colored_label(color, text);
-                    if ui.small_button("✕").clicked() {
-                        self.message = None;
-                    }
+                    ui.colored_label(if is_err { RED } else { GREEN }, text);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").clicked() {
+                            self.message = None;
+                        }
+                    });
                 });
             });
         }
         egui::CentralPanel::default_margins().show(ui, |ui| match self.tab {
-            Tab::Hosts => self.hosts_tab(ui),
+            Tab::Hosts => self.computers_tab(ui),
             Tab::ThisPc => self.this_pc_tab(ui),
         });
+    }
+}
+
+// ---------- look ----------
+
+const GREEN: Color32 = Color32::from_rgb(52, 199, 89);
+const YELLOW: Color32 = Color32::from_rgb(255, 204, 0);
+const RED: Color32 = Color32::from_rgb(255, 99, 88);
+const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
+
+fn apply_style(ctx: &egui::Context) {
+    ctx.set_visuals(egui::Visuals::dark());
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+        style.spacing.button_padding = Vec2::new(10.0, 4.0);
+    });
+}
+
+fn primary_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(egui::RichText::new(text).color(Color32::WHITE)).fill(ACCENT)
+}
+
+fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).corner_radius(8.0).inner_margin(10.0).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        },
+    );
+    ui.add_space(4.0);
+}
+
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.0, color);
+}
+
+/// "P2P напрямую, 2 мс · 58 к/с · потери 0% · …" → "P2P · 2 мс · 58 к/с".
+fn short_status(status: &str) -> String {
+    let parts: Vec<&str> = status.split(" · ").collect();
+    if parts.len() < 3 {
+        return status.to_string();
+    }
+    let route = parts[0].replace("P2P напрямую", "P2P").replace("через relay", "relay").replace(", ", " · ");
+    format!("{route} · {} · {}", parts[1], parts[2])
+}
+
+// ---------- drawing ----------
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tool {
+    Control,
+    Pen,
+    Laser,
+}
+
+fn norm_in(p: Pos2, rect: Rect) -> Option<(u16, u16)> {
+    rect.contains(p).then(|| {
+        let x = ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+        let y = ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+        ((x * 65535.0) as u16, (y * 65535.0) as u16)
+    })
+}
+
+/// Turns pointer events into drawing events: applied locally at once and sent to the host overlay.
+fn draw_input(view: &mut DesktopView, events: &[egui::Event], rect: Rect) {
+    let now = Instant::now();
+    let emit = |view: &mut DesktopView, ev: DrawEvent| {
+        view.ink.apply(&ev, now);
+        let _ = view.out.send(ClientMsg::Draw(ev));
+    };
+    for ev in events {
+        match ev {
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } => {
+                if *pressed && view.tool == Tool::Pen && rect.contains(*pos) {
+                    view.stroke_seq += 1;
+                    view.drawing = Some(view.stroke_seq);
+                    if let Some((x, y)) = norm_in(*pos, rect) {
+                        let (stroke, color) = (view.stroke_seq, annotate::COLORS[view.color]);
+                        emit(view, DrawEvent::Point { stroke, x, y, color });
+                    }
+                } else if !*pressed && let Some(stroke) = view.drawing.take() {
+                    emit(view, DrawEvent::End { stroke });
+                }
+            }
+            egui::Event::PointerMoved(pos) => match (view.tool, view.drawing) {
+                (Tool::Pen, Some(stroke)) => {
+                    if let Some((x, y)) = norm_in(*pos, rect) {
+                        let color = annotate::COLORS[view.color];
+                        emit(view, DrawEvent::Point { stroke, x, y, color });
+                    }
+                }
+                (Tool::Laser, _) => {
+                    if let Some((x, y)) = norm_in(*pos, rect) {
+                        emit(view, DrawEvent::Laser { x, y });
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+/// Draws the local copy of the ink over the video and keeps animating while it fades.
+fn paint_ink(painter: &egui::Painter, ink: &mut Ink, rect: Rect) {
+    let now = Instant::now();
+    if !ink.prune(now) {
+        return;
+    }
+    let to_screen = |(x, y): (f32, f32)| Pos2::new(rect.min.x + x * rect.width(), rect.min.y + y * rect.height());
+    let width = (annotate::STROKE_WIDTH * rect.height()).max(2.0);
+    for s in &ink.strokes {
+        let a = Ink::stroke_alpha(s, now);
+        let color = Color32::from_rgba_unmultiplied(s.color[0], s.color[1], s.color[2], (a * 255.0) as u8);
+        let points: Vec<Pos2> = s.points.iter().map(|&p| to_screen(p)).collect();
+        if points.len() == 1 {
+            painter.circle_filled(points[0], width / 2.0, color);
+        } else {
+            painter.add(egui::Shape::line(points, egui::Stroke::new(width, color)));
+        }
+    }
+    for (a, b, alpha) in ink.laser_trail(now) {
+        let color = Color32::from_rgba_unmultiplied(255, 40, 40, (alpha * 160.0) as u8);
+        painter.line_segment([to_screen(a), to_screen(b)], egui::Stroke::new(width * 1.6, color));
+    }
+    if let Some((p, alpha)) = ink.laser_dot(now) {
+        painter.circle_filled(
+            to_screen(p),
+            width * 4.0,
+            Color32::from_rgba_unmultiplied(255, 40, 40, (alpha * 64.0) as u8),
+        );
+        painter.circle_filled(
+            to_screen(p),
+            width * 2.0,
+            Color32::from_rgba_unmultiplied(255, 40, 40, (alpha * 255.0) as u8),
+        );
+    }
+    painter.ctx().request_repaint();
+}
+
+/// Desktop-profile input: absolute mouse, text, keys (physical keys on the remote lock screen).
+fn remote_input(
+    view: &mut DesktopView,
+    events: &[egui::Event],
+    mods: egui::Modifiers,
+    rect: Rect,
+    ctx: &egui::Context,
+) {
+    let secure = view.shared.secure_desktop.load(Ordering::Relaxed);
+    let out = &view.out;
+    let send = |ev: InputEvent| {
+        let _ = out.send(ClientMsg::Input(ev));
+    };
+    if secure {
+        view.secure_keys.sync_modifiers(mods, &send);
+    } else if !view.secure_keys.pressed.is_empty() {
+        view.secure_keys.release_all(&send);
+    }
+    for ev in events {
+        if let egui::Event::Key { key: egui::Key::F11, pressed: true, .. } = ev {
+            view.fullscreen ^= true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(view.fullscreen));
+            continue;
+        }
+        // Lock screen: keys go as physical presses; text and clipboard events would not register there.
+        if secure {
+            match ev {
+                egui::Event::Key { key, physical_key, pressed, .. } => {
+                    view.secure_keys.key(physical_key.unwrap_or(*key), *pressed, &send);
+                    continue;
+                }
+                egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut => continue,
+                _ => {}
+            }
+        }
+        for msg in translate(ev, rect, &mut view.last_pos, &mut view.wheel) {
+            send(msg);
+        }
     }
 }
 
