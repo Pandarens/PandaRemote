@@ -1,6 +1,7 @@
 // Hide the console window for the GUI build in release.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod autostart;
 mod client;
 mod config;
 mod gui;
@@ -22,6 +23,9 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Открыть окно свёрнутым (так запускает автозагрузка Windows)
+    #[arg(long, global = true)]
+    minimized: bool,
 }
 
 #[derive(Subcommand)]
@@ -52,6 +56,8 @@ enum Command {
     },
     /// Показать журнал подключений к этому ПК
     Log,
+    /// Проверить, в сети ли компьютер с этим билетом
+    Ping { ticket: String },
     /// Диагностика: скорость H.264-энкодера на синтетических кадрах 1080p
     #[command(hide = true)]
     BenchEncoder {
@@ -137,9 +143,9 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     match cli.command {
-        None => gui::run(rt, None),
+        None => gui::run(rt, None, cli.minimized),
         Some(Command::Connect { ticket, game }) => {
-            gui::run(rt, Some((ticket::Ticket::decode(&ticket)?, profile(game))))
+            gui::run(rt, Some((ticket::Ticket::decode(&ticket)?, profile(game))), cli.minimized)
         }
         Some(Command::Ticket) => {
             let cfg = config::HostConfig::load_or_create().map_err(service_files_hint)?;
@@ -147,6 +153,14 @@ fn main() -> Result<()> {
             println!("{}", t.encode());
             Ok(())
         }
+        Some(Command::Ping { ticket }) => rt.block_on(async {
+            let ticket = ticket::Ticket::decode(&ticket)?;
+            match client::ping(ticket.host_id).await {
+                Ok(route) => println!("В сети: {route}"),
+                Err(e) => println!("Не в сети: {e:#}"),
+            }
+            Ok(())
+        }),
         Some(Command::Log) => {
             let entries = config::read_journal(100);
             if entries.is_empty() && config::service_installed() {
@@ -184,7 +198,11 @@ fn main() -> Result<()> {
         Some(Command::Host { rotate_secret, service_helper }) => rt.block_on(async {
             // Two hosts with one key would fight over the relay; the service already serves this PC.
             #[cfg(windows)]
-            if !service_helper && service::status() == Some(windows_service::service::ServiceState::Running) {
+            // A separate PANDA_HOME means a separate identity (tests), which doesn't compete with the service.
+            if !service_helper
+                && std::env::var_os("PANDA_HOME").is_none()
+                && service::status() == Some(windows_service::service::ServiceState::Running)
+            {
                 anyhow::bail!("на этом ПК уже работает служба Panda Remote; она принимает подключения");
             }
             let mut cfg = config::HostConfig::load_or_create()?;

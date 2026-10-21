@@ -60,6 +60,30 @@ pub fn session_locked() -> bool {
     }
 }
 
+/// Locks the console session (back to the lock screen). Falls back to disconnecting the session,
+/// which also ends at the lock screen, if `LockWorkStation` is refused.
+pub fn lock_session() {
+    use windows::Win32::System::{
+        RemoteDesktop::{ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTSDisconnectSession},
+        Shutdown::LockWorkStation,
+        Threading::GetCurrentProcessId,
+    };
+    unsafe {
+        match LockWorkStation() {
+            Ok(()) => tracing::info!("session locked again"),
+            Err(e) => {
+                tracing::warn!("LockWorkStation failed ({e}), disconnecting the session instead");
+                let mut session = 0u32;
+                if ProcessIdToSessionId(GetCurrentProcessId(), &mut session).is_ok()
+                    && let Err(e) = WTSDisconnectSession(Some(WTS_CURRENT_SERVER_HANDLE), session, false)
+                {
+                    tracing::warn!("WTSDisconnectSession failed: {e}");
+                }
+            }
+        }
+    }
+}
+
 /// Name of the desktop the calling thread is attached to.
 pub fn thread_desktop_name() -> Option<String> {
     unsafe { GetThreadDesktop(GetCurrentThreadId()).ok().and_then(desktop_name) }

@@ -88,6 +88,9 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
     };
     // Host -> viewer notifications: vibration, and whether the lock screen / UAC is showing
     // (the viewer then sends physical keys, so a password typed remotely lands in the lock screen's layout).
+    // If the PC was locked at any point of this session and the viewer unlocked it, lock it again when
+    // they leave, so nobody walks up to an unlocked PC afterwards.
+    let was_locked = AtomicBool::new(session_locked());
     let notify = async {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
         let (mut secure, mut rumble_open) = (false, true);
@@ -98,6 +101,9 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
                     None => rumble_open = false,
                 },
                 _ = tick.tick() => {
+                    if session_locked() {
+                        was_locked.store(true, Ordering::Relaxed);
+                    }
                     let now = on_secure_desktop();
                     if now != secure {
                         secure = now;
@@ -116,6 +122,10 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
         _ = conn.closed() => Ok(()),
     };
     control.stop.store(true, Ordering::Relaxed);
+    if was_locked.load(Ordering::Relaxed) && !session_locked() {
+        #[cfg(windows)]
+        super::desktop_switch::lock_session();
+    }
     audio_stop.store(true, Ordering::Relaxed);
     // A closed control stream is the normal way a viewer leaves.
     match result {
@@ -124,9 +134,16 @@ pub async fn serve(conn: &Connection, profile: Profile, mut send: SendStream, mu
     }
 }
 
+fn session_locked() -> bool {
+    #[cfg(windows)]
+    return super::desktop_switch::session_locked();
+    #[cfg(not(windows))]
+    false
+}
+
 fn on_secure_desktop() -> bool {
     #[cfg(windows)]
-    return super::desktop_switch::session_locked()
+    return session_locked()
         || super::desktop_switch::input_desktop_name().is_some_and(|n| !n.eq_ignore_ascii_case("Default"));
     #[cfg(not(windows))]
     false

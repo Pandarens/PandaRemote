@@ -168,6 +168,41 @@ mod hex32 {
     }
 }
 
+// ---------- user settings ----------
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Settings {
+    /// Start Panda (minimized) when the user logs in to Windows.
+    #[serde(default = "yes")]
+    pub autostart: bool,
+    /// The in-app host was on when the app last closed: turn it back on at start.
+    #[serde(default)]
+    pub host_enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { autostart: true, host_enabled: false }
+    }
+}
+
+pub fn load_settings() -> Settings {
+    path("settings.json")
+        .ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_settings(settings: &Settings) -> Result<()> {
+    fs::write(path("settings.json")?, serde_json::to_string_pretty(settings)?)?;
+    Ok(())
+}
+
 // ---------- saved hosts (client side) ----------
 
 #[derive(Serialize, Deserialize, Clone)]

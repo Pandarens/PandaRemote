@@ -1,9 +1,9 @@
 //! Desktop GUI (eframe/egui): saved hosts, remote-desktop viewer, "this PC" host panel.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -15,6 +15,7 @@ use eframe::egui::{self, Color32, Pos2, Rect, Sense, TextureHandle, TextureOptio
 use tokio::{runtime::Runtime, sync::mpsc as tmpsc, task::JoinHandle};
 
 use crate::{
+    autostart,
     client::{self, gamepad, viewer},
     config::{self, HostConfig, JournalEntry, SavedHost},
     host::Host,
@@ -23,7 +24,7 @@ use crate::{
     yuv_render::{self, PendingFrame},
 };
 
-pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>) -> Result<()> {
+pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>, minimized: bool) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("Panda Remote").with_inner_size([1100.0, 720.0]),
         ..Default::default()
@@ -33,7 +34,7 @@ pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>) -> Result<()> {
         options,
         Box::new(move |cc| {
             let gpu_video = yuv_render::init(cc.wgpu_render_state.as_ref());
-            Ok(Box::new(App::new(cc.egui_ctx.clone(), rt, initial, gpu_video)))
+            Ok(Box::new(App::new(cc.egui_ctx.clone(), rt, initial, gpu_video, minimized)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
@@ -72,7 +73,21 @@ struct App {
     desktop: Option<DesktopView>,
     /// NV12 frames are drawn by a wgpu shader; otherwise converted to RGBA on the CPU.
     gpu_video: bool,
+    settings: config::Settings,
+    /// Online state of saved hosts, by host id; refreshed in the background.
+    presence: Arc<Mutex<HashMap<iroh::EndpointId, Presence>>>,
+    /// Hosts the background checker pings (follows `hosts`).
+    ping_targets: Arc<Mutex<Vec<iroh::EndpointId>>>,
 }
+
+#[derive(Clone)]
+enum Presence {
+    Online(String),
+    Offline,
+}
+
+/// How often saved hosts are checked for being online.
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(20);
 
 struct ThisPc {
     host: Option<Host>,
@@ -165,8 +180,22 @@ impl Drop for GameInput {
 }
 
 impl App {
-    fn new(ctx: egui::Context, rt: Runtime, initial: Option<(Ticket, Profile)>, gpu_video: bool) -> Self {
+    fn new(
+        ctx: egui::Context,
+        rt: Runtime,
+        initial: Option<(Ticket, Profile)>,
+        gpu_video: bool,
+        minimized: bool,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
+        if minimized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        let settings = config::load_settings();
+        if settings.autostart {
+            // Re-register on every start: keeps the entry pointing at the current program location.
+            let _ = autostart::set(true);
+        }
         let mut app = App {
             rt,
             ctx,
@@ -189,11 +218,46 @@ impl App {
             },
             desktop: None,
             gpu_video,
+            settings,
+            presence: Arc::default(),
+            ping_targets: Arc::default(),
         };
+        *app.ping_targets.lock().unwrap() = app.host_ids();
+        app.spawn_presence_checker();
+        if app.settings.host_enabled && !config::service_installed() {
+            app.start_host();
+        }
         if let Some((t, profile)) = initial {
             app.start_session("Удалённый ПК".into(), t.encode(), profile);
         }
         app
+    }
+
+    fn host_ids(&self) -> Vec<iroh::EndpointId> {
+        self.hosts.iter().filter_map(|h| Ticket::decode(&h.ticket).ok()).map(|t| t.host_id).collect()
+    }
+
+    /// Pings every saved host in the background so the list shows which ones are online.
+    fn spawn_presence_checker(&self) {
+        let (targets, presence, ctx) = (self.ping_targets.clone(), self.presence.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            loop {
+                let ids = targets.lock().unwrap().clone();
+                let mut checks = tokio::task::JoinSet::new();
+                for id in ids {
+                    checks.spawn(async move { (id, client::ping(id).await) });
+                }
+                while let Some(Ok((id, result))) = checks.join_next().await {
+                    let state = match result {
+                        Ok(route) => Presence::Online(route),
+                        Err(_) => Presence::Offline,
+                    };
+                    presence.lock().unwrap().insert(id, state);
+                    ctx.request_repaint();
+                }
+                tokio::time::sleep(PRESENCE_INTERVAL).await;
+            }
+        });
     }
 
     fn send_event(&self) -> impl Fn(UiEvent) + Send + Clone + 'static {
@@ -299,6 +363,7 @@ impl App {
     }
 
     fn start_host(&mut self) {
+        self.set_host_enabled(true);
         self.this_pc.starting = true;
         self.this_pc.online = false;
         let send = self.send_event();
@@ -317,7 +382,16 @@ impl App {
         });
     }
 
+    /// Remembers whether the in-app host is on, so the next start (e.g. autostart) restores it.
+    fn set_host_enabled(&mut self, on: bool) {
+        if self.settings.host_enabled != on {
+            self.settings.host_enabled = on;
+            let _ = config::save_settings(&self.settings);
+        }
+    }
+
     fn stop_host(&mut self) {
+        self.set_host_enabled(false);
         if let Some(host) = self.this_pc.host.take() {
             self.rt.spawn(host.shutdown());
         }
@@ -334,14 +408,38 @@ impl App {
         if self.hosts.is_empty() {
             ui.label("Пока пусто. Запустите хост на удалённом ПК (вкладка «Этот компьютер»), скопируйте билет и добавьте его ниже.");
         }
+        *self.ping_targets.lock().unwrap() = self.host_ids();
+        let presence = self.presence.lock().unwrap().clone();
+        let state = |h: &SavedHost| Ticket::decode(&h.ticket).ok().and_then(|t| presence.get(&t.host_id).cloned());
+        // Online computers first, otherwise in the saved order.
+        let mut order: Vec<usize> = (0..self.hosts.len()).collect();
+        order.sort_by_key(|&i| !matches!(state(&self.hosts[i]), Some(Presence::Online(_))));
         egui::Grid::new("hosts").striped(true).spacing([16.0, 8.0]).show(ui, |ui| {
-            for (i, h) in self.hosts.iter().enumerate() {
+            for i in order {
+                let h = &self.hosts[i];
+                match state(h) {
+                    Some(Presence::Online(route)) => {
+                        ui.colored_label(Color32::from_rgb(80, 200, 120), "●").on_hover_text(&route);
+                    }
+                    Some(Presence::Offline) => {
+                        ui.colored_label(Color32::GRAY, "●").on_hover_text("не в сети");
+                    }
+                    None => {
+                        ui.colored_label(Color32::YELLOW, "●").on_hover_text("проверка…");
+                    }
+                }
                 ui.label(egui::RichText::new(&h.name).strong());
                 let id = Ticket::decode(&h.ticket).map(|t| t.host_id.fmt_short().to_string()).unwrap_or_default();
                 ui.label(egui::RichText::new(id).monospace().weak());
-                ui.label(
-                    h.last_connected.as_deref().map(|t| format!("был: {}", &t[..16.min(t.len())])).unwrap_or_default(),
-                );
+                ui.label(match state(h) {
+                    Some(Presence::Online(route)) => format!("в сети · {route}"),
+                    Some(Presence::Offline) => h
+                        .last_connected
+                        .as_deref()
+                        .map(|t| format!("не в сети · был: {}", &t[..16.min(t.len())]))
+                        .unwrap_or_else(|| "не в сети".into()),
+                    None => "проверка…".into(),
+                });
                 if ui.button("🖥 Рабочий стол").clicked() {
                     action = Some((i, "desktop"));
                 }
@@ -481,6 +579,14 @@ impl App {
 
     fn this_pc_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Этот компьютер");
+        ui.add_space(6.0);
+        if ui.checkbox(&mut self.settings.autostart, "Запускать Panda при входе в Windows (свёрнутой)").changed()
+        {
+            let _ = config::save_settings(&self.settings);
+            if let Err(e) = autostart::set(self.settings.autostart) {
+                self.message = Some((true, format!("Автозапуск: {e:#}")));
+            }
+        }
         ui.add_space(6.0);
 
         // With the Windows service installed it is the host; the in-app host would fight it over the key.

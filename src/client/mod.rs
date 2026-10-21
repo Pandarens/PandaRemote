@@ -59,6 +59,28 @@ pub async fn connect(ticket: &Ticket, profile: Profile) -> Result<Session> {
     Ok(Session { conn, send, recv, host_name })
 }
 
+/// Checks whether a host is online; returns its route (P2P/relay, RTT) when it answered.
+pub async fn ping(host_id: iroh::EndpointId) -> Result<String> {
+    let ep = endpoint().await?;
+    match tokio::time::timeout(Duration::from_secs(8), ep.connect(host_id, proto::PING_ALPN)).await {
+        Err(_) => bail!("не отвечает"),
+        Ok(Ok(conn)) => {
+            let route = path_summary(&conn);
+            conn.close(0u32.into(), b"ping");
+            Ok(route)
+        }
+        Ok(Err(e)) => {
+            // Hosts from before the ping protocol refuse it during the handshake, which still proves they are up.
+            let text = format!("{e:#}").to_lowercase();
+            if text.contains("alpn") || text.contains("application protocol") || text.contains("known protocol") {
+                Ok("старая версия Panda, обновите её".into())
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
 /// Human-readable route: direct P2P or via relay, plus round-trip time.
 pub fn path_summary(conn: &Connection) -> String {
     let paths = conn.paths();

@@ -43,7 +43,7 @@ impl Host {
         let id = endpoint.id();
         let ticket = Ticket { host_id: id, secret: cfg.access_secret };
         let handler = Handler { cfg: Arc::new(cfg), id };
-        let router = Router::builder(endpoint).accept(proto::ALPN, handler).spawn();
+        let router = Router::builder(endpoint).accept(proto::ALPN, handler).accept(proto::PING_ALPN, Ping).spawn();
         Ok(Host { router, ticket })
     }
 
@@ -59,6 +59,17 @@ impl Host {
 
     pub async fn shutdown(self) {
         let _ = self.router.shutdown().await;
+    }
+}
+
+/// Answers presence checks: the finished handshake is the answer.
+#[derive(Debug, Clone)]
+struct Ping;
+
+impl ProtocolHandler for Ping {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        conn.close(0u32.into(), b"pong");
+        Ok(())
     }
 }
 

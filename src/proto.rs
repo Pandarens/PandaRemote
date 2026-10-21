@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 /// Single ALPN; the stream profile is chosen in [`ClientMsg::Hello`].
 pub const ALPN: &[u8] = b"panda-rc/2";
 pub const PROTOCOL_VERSION: u32 = 2;
+/// Presence check: the host completes the handshake and closes, nothing else (no auth, no data).
+pub const PING_ALPN: &[u8] = b"panda-rc/ping";
 const MAX_FRAME: usize = 32 * 1024 * 1024;
 
 /// Streaming profile: picks frame rate, bitrate range and input model.
