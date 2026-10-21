@@ -890,7 +890,8 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let busy = self.this_pc.service_busy;
                     if let Some(pin) = self.this_pc.pin_edit.as_mut() {
-                        let ok = config::valid_pin(pin);
+                        // Not while another elevated step (e.g. a service update) is rewriting the service's files.
+                        let ok = config::valid_pin(pin) && !busy;
                         let save =
                             ui.add_enabled_ui(ok, |ui| button(ui, None, "Сохранить", Kind::Primary)).inner.clicked();
                         let cancel = button(ui, None, "Отмена", Kind::Ghost).clicked();
