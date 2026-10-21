@@ -62,7 +62,18 @@ pub fn install() -> Result<()> {
     if let Some(service) = &existing {
         stop_and_wait(service)?;
     }
+    let result = deploy(&manager, existing.as_ref());
+    if result.is_err()
+        && let Some(service) = &existing
+    {
+        // Don't leave the PC unreachable: bring the previous version back up.
+        let _ = service.start::<&str>(&[]);
+    }
+    result
+}
 
+/// Locks down the data directory, copies the program and host files, then registers and starts the service.
+fn deploy(manager: &ServiceManager, existing: Option<&windows_service::service::Service>) -> Result<()> {
     // The service runs as SYSTEM with whatever key and secret it finds here, so the directory must not be
     // writable (or pre-seeded) by ordinary users: take ownership, drop inherited rights, and allow only
     // SYSTEM and Administrators. Then always copy this user's files over (existing tickets keep working).
@@ -96,14 +107,18 @@ pub fn install() -> Result<()> {
         account_name: None, // LocalSystem
         account_password: None,
     };
+    let created;
     let service = match existing {
         Some(service) => {
             service.change_config(&info).context("не удалось обновить службу")?;
             service
         }
-        None => manager
-            .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-            .context("не удалось создать службу")?,
+        None => {
+            created = manager
+                .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+                .context("не удалось создать службу")?;
+            &created
+        }
     };
     let _ = service.set_description("Удалённый доступ Panda Remote: экран блокировки, UAC, работа до входа в систему");
     config::set_service_installed(true)?;
@@ -129,10 +144,16 @@ fn stop_and_wait(service: &windows_service::service::Service) -> Result<()> {
 }
 
 /// Owner = Administrators, no inheritance, full control for SYSTEM and Administrators only (by SID, so it
-/// works on localized Windows).
-fn lock_down(dir: &std::path::Path) -> Result<()> {
-    icacls(dir, &["/setowner", "*S-1-5-32-544", "/T", "/Q"])?;
-    icacls(dir, &["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/Q"])
+/// works on localized Windows). The directories themselves must succeed; their contents are best effort,
+/// since a log may still be held by a service that is just exiting (the key and secret are recreated anyway).
+fn lock_down(root: &std::path::Path) -> Result<()> {
+    const ADMINS: &str = "*S-1-5-32-544";
+    for dir in [root.to_path_buf(), config::machine_dir()] {
+        icacls(&dir, &["/setowner", ADMINS, "/Q"])?;
+        icacls(&dir, &["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/Q"])?;
+    }
+    let _ = icacls(root, &["/setowner", ADMINS, "/T", "/C", "/Q"]);
+    Ok(())
 }
 
 fn icacls(path: &std::path::Path, args: &[&str]) -> Result<()> {
