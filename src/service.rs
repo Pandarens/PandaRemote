@@ -80,10 +80,24 @@ fn deploy(manager: &ServiceManager, existing: Option<&windows_service::service::
     let to = config::machine_dir();
     std::fs::create_dir_all(&to).with_context(|| format!("create {}", to.display()))?;
     lock_down(to.parent().unwrap_or(&to))?;
-    // Users may enter the directories (to read the logs and journal shared with them), nothing more.
-    for dir in [to.parent().unwrap_or(&to), to.as_path()] {
-        icacls(dir, &["/grant", "*S-1-5-32-545:(RX)", "/Q"])?;
-    }
+    // Users may pass through the top directory to the logs, which they may read; `config` stays closed.
+    icacls(to.parent().unwrap_or(&to), &["/grant", "*S-1-5-32-545:(RX)", "/Q"])?;
+    // An earlier version let users list `config`; take that back.
+    icacls(&to, &["/remove:g", "*S-1-5-32-545", "/Q"])?;
+    let logs = config::machine_logs_dir();
+    std::fs::create_dir_all(&logs).with_context(|| format!("create {}", logs.display()))?;
+    icacls(&logs, &["/setowner", "*S-1-5-32-544", "/Q"])?;
+    icacls(
+        &logs,
+        &[
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "*S-1-5-32-545:(OI)(CI)RX",
+            "/Q",
+        ],
+    )?;
     // The service runs its own copy, so the original can be rebuilt or moved while it runs.
     let exe = install_binary()?;
     let from = config::user_dir();
@@ -121,7 +135,6 @@ fn deploy(manager: &ServiceManager, existing: Option<&windows_service::service::
         }
     };
     let _ = service.set_description("Удалённый доступ Panda Remote: экран блокировки, UAC, работа до входа в систему");
-    config::set_service_installed(true)?;
     service.start::<&str>(&[]).context("служба создана, но не запустилась")?;
     Ok(())
 }
@@ -191,7 +204,6 @@ pub fn uninstall() -> Result<()> {
         .context("служба не установлена")?;
     stop_and_wait(&service)?;
     service.delete()?;
-    config::set_service_installed(false)?;
     // The installed copy is no longer in use (best effort: it may still be shutting down).
     if let Ok(exe) = install_binary_path()
         && exe != std::env::current_exe()?

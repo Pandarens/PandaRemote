@@ -112,7 +112,7 @@ fn init_logging(cli: &Cli) {
         _ => None,
     };
     if let Some(name) = file_name {
-        let dir = config::machine_dir();
+        let dir = config::machine_logs_dir();
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(name);
         // Keep logs bounded: start over once they pass 5 MB.
@@ -120,7 +120,6 @@ fn init_logging(cli: &Cli) {
             let _ = std::fs::remove_file(&path);
         }
         if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            config::share_read_with_users(&path);
             tracing_subscriber::fmt()
                 .with_env_filter(filter())
                 .with_ansi(false)
@@ -151,7 +150,7 @@ fn main() -> Result<()> {
         Some(Command::Log) => {
             let entries = config::read_journal(100);
             if entries.is_empty() && config::service_installed() {
-                eprintln!("Журнал службы доступен только администраторам: запустите терминал от имени администратора.");
+                eprintln!("Журнал службы пока пуст: {}", config::machine_logs_dir().join("connections.log").display());
             }
             for e in entries.into_iter().rev() {
                 println!(

@@ -437,7 +437,9 @@ impl App {
             }
             // The service's files are readable by administrators only.
             Err(_) => {
-                ui.label("Билет и журнал службы доступны администраторам: panda-rc ticket / panda-rc log в терминале администратора.");
+                ui.label(
+                    "Билет службы доступен администраторам: panda-rc ticket в терминале администратора. Журнал — ниже.",
+                );
             }
         }
         ui.add_space(6.0);

@@ -29,39 +29,36 @@ pub fn machine_dir() -> PathBuf {
     base.join("PandaRC").join("config")
 }
 
-const SERVICE_MARKER: &str = "service.installed";
-
-/// True when `panda-rc service install` set this machine up for the service.
+/// True when the Panda Remote Windows service is registered (readable by every user, unlike its files).
 pub fn service_installed() -> bool {
-    machine_dir().join(SERVICE_MARKER).exists()
-}
-
-pub fn set_service_installed(installed: bool) -> Result<()> {
-    let marker = machine_dir().join(SERVICE_MARKER);
-    if installed {
-        fs::create_dir_all(machine_dir())?;
-        fs::write(marker, b"")?;
-    } else if marker.exists() {
-        fs::remove_file(marker)?;
-    }
-    Ok(())
-}
-
-/// Grants the local Users group read access to a non-secret file in the locked-down machine directory
-/// (logs, journal). Best effort: does nothing when not allowed (e.g. a normal user process).
-pub fn share_read_with_users(path: &std::path::Path) {
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("icacls")
-            .arg(path)
-            .args(["/grant", "*S-1-5-32-545:R", "/Q"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+    unsafe {
+        use windows::{
+            Win32::System::Registry::{HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW},
+            core::w,
+        };
+        let mut key = HKEY::default();
+        let found = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            w!("SYSTEM\\CurrentControlSet\\Services\\PandaRemote"),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+        .is_ok();
+        if found {
+            let _ = RegCloseKey(key);
+        }
+        found
     }
     #[cfg(not(windows))]
-    let _ = path;
+    false
+}
+
+/// Machine-wide logs: service and helper logs plus the service's connection journal. Readable by
+/// every local user, unlike `machine_dir()` with the key and secret.
+pub fn machine_logs_dir() -> PathBuf {
+    machine_dir().parent().map(|p| p.join("logs")).unwrap_or_else(|| PathBuf::from("logs"))
 }
 
 /// Where the host's identity, secret and journal live.
@@ -80,6 +77,12 @@ fn path(name: &str) -> Result<PathBuf> {
 
 fn host_path(name: &str) -> Result<PathBuf> {
     in_dir(host_dir(), name)
+}
+
+/// The service keeps its journal with its logs, where ordinary users (the GUI) can read it.
+fn journal_path() -> Result<PathBuf> {
+    let dir = if host_dir() == machine_dir() { machine_logs_dir() } else { host_dir() };
+    in_dir(dir, "connections.log")
 }
 
 /// Loads a 32-byte secret key from `p`, generating it on first use.
@@ -211,12 +214,7 @@ pub fn journal(client_id: &str, client_name: &str, event: &str, detail: &str) {
     };
     tracing::info!(client_id, client_name, event, detail, "journal");
     let write = || -> Result<()> {
-        let path = host_path("connections.log")?;
-        let created = !path.exists();
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
-        if created {
-            share_read_with_users(&path);
-        }
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(journal_path()?)?;
         writeln!(f, "{}", serde_json::to_string(&entry)?)?;
         Ok(())
     };
@@ -226,7 +224,7 @@ pub fn journal(client_id: &str, client_name: &str, event: &str, detail: &str) {
 }
 
 pub fn read_journal(last: usize) -> Vec<JournalEntry> {
-    let Ok(text) = host_path("connections.log").and_then(|p| Ok(fs::read_to_string(p)?)) else {
+    let Ok(text) = journal_path().and_then(|p| Ok(fs::read_to_string(p)?)) else {
         return Vec::new();
     };
     let mut entries: Vec<JournalEntry> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
