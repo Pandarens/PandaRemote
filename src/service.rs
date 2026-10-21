@@ -182,9 +182,26 @@ fn install_binary() -> Result<std::path::PathBuf> {
     let target = install_binary_path()?;
     std::fs::create_dir_all(target.parent().unwrap()).with_context(|| format!("create {}", target.display()))?;
     let current = std::env::current_exe()?;
-    if current != target {
-        std::fs::copy(&current, &target).with_context(|| format!("copy program to {}", target.display()))?;
+    if current == target {
+        return Ok(target);
     }
+    let dir = target.parent().unwrap().to_path_buf();
+    // Leftovers from earlier upgrades whose processes have exited by now.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("panda-rc.old-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    // A program that is still running (the stopping service or its helper) can't be overwritten,
+    // but it can be renamed: move it aside and put the new one in its place.
+    if target.exists() && std::fs::remove_file(&target).is_err() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let aside = dir.join(format!("panda-rc.old-{stamp}.exe"));
+        std::fs::rename(&target, &aside).with_context(|| format!("move busy {} aside", target.display()))?;
+    }
+    std::fs::copy(&current, &target).with_context(|| format!("copy program to {}", target.display()))?;
     Ok(target)
 }
 
