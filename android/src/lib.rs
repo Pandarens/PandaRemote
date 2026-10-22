@@ -17,6 +17,7 @@ use android_activity::AndroidApp;
 use panda_rc::{
     client::{self, viewer},
     config::{self, SavedHost},
+    release::{self, Version},
     icons::Icon,
     proto::Profile,
     ticket::Ticket,
@@ -81,7 +82,12 @@ pub struct App {
     message: Option<(bool, String)>,
     session: Option<Session>,
     pin: Option<PinPrompt>,
+    /// A newer release with an APK: its version and download link.
+    update: Arc<Mutex<Option<(Version, String)>>>,
 }
+
+/// File name of the app in GitHub releases (built and signed by CI).
+const APK_ASSET: &str = "panda-remote.apk";
 
 impl App {
     fn new(ctx: egui::Context, rt: Runtime, android: AndroidApp) -> Self {
@@ -99,9 +105,28 @@ impl App {
             message: None,
             session: None,
             pin: None,
+            update: Arc::default(),
         };
         app.spawn_presence();
+        app.spawn_update_check();
         app
+    }
+
+    /// Looks for a newer release once at start (Android installs it only with the user's consent anyway).
+    fn spawn_update_check(&self) {
+        let (update, ctx) = (self.update.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            match release::latest().await {
+                Ok(Some(rel)) if rel.version > Version::current() => {
+                    if let Some(url) = rel.asset(APK_ASSET) {
+                        *update.lock().unwrap() = Some((rel.version, url.to_string()));
+                        ctx.request_repaint();
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("update check failed: {e:#}"),
+            }
+        });
     }
 
     fn host_ids(&self) -> Vec<iroh::EndpointId> {
@@ -194,6 +219,7 @@ impl App {
         ui.horizontal(|ui| {
             icon(ui, Icon::Panda, TEXT, 26.0);
             ui.label(semibold("Panda", 20.0));
+            ui.label(muted(Version::current().to_string()).small());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if button(ui, Some(Icon::Plus), "Добавить", Kind::Primary).clicked() {
                     self.adding = Some((String::new(), String::new()));
@@ -201,6 +227,21 @@ impl App {
             });
         });
         ui.add_space(10.0);
+
+        let update = self.update.lock().unwrap().clone();
+        if let Some((version, url)) = update {
+            card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    icon(ui, Icon::Download, ACCENT, 22.0);
+                    ui.label(semibold(format!("Доступна версия {version}"), 16.0));
+                });
+                ui.label(muted("Телефон скачает APK и предложит установить его поверх этой версии — компьютеры сохранятся."));
+                ui.add_space(6.0);
+                if button(ui, Some(Icon::Download), "Обновить", Kind::Primary).clicked() && !open_url(&self.android, &url) {
+                    self.message = Some((true, format!("Не удалось открыть ссылку: {url}")));
+                }
+            });
+        }
 
         if let Some((name, ticket)) = self.adding.as_mut() {
             let mut done = None;
@@ -375,32 +416,56 @@ impl eframe::App for App {
     }
 }
 
-/// Text on the Android clipboard (ClipboardManager over JNI).
-fn clipboard_text(app: &AndroidApp) -> Option<String> {
-    use jni::objects::{JObject, JString};
+/// Runs `f` with a JNI environment and the activity object; any Java exception is cleared and reported as `None`.
+fn with_activity<R>(
+    app: &AndroidApp,
+    f: impl FnOnce(&mut jni::JNIEnv, &jni::objects::JObject) -> jni::errors::Result<R>,
+) -> Option<R> {
     let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr() as *mut _) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
-    let activity = unsafe { JObject::from_raw(app.activity_as_ptr() as jni::sys::jobject) };
-    let name = env.new_string("clipboard").ok()?;
-    let manager = env
-        .call_method(&activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[(&name).into()])
-        .ok()?
-        .l()
-        .ok()?;
-    let clip = env.call_method(&manager, "getPrimaryClip", "()Landroid/content/ClipData;", &[]).ok()?.l().ok()?;
-    if clip.is_null() {
-        return None;
+    // The activity reference belongs to the Android runtime: borrowed, never deleted here.
+    let activity = std::mem::ManuallyDrop::new(unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr() as jni::sys::jobject) });
+    let result = f(&mut env, &activity);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
     }
-    let item = env.call_method(&clip, "getItemAt", "(I)Landroid/content/ClipData$Item;", &[0i32.into()]).ok()?.l().ok()?;
-    let text = env
-        .call_method(&item, "coerceToText", "(Landroid/content/Context;)Ljava/lang/CharSequence;", &[(&activity).into()])
-        .ok()?
-        .l()
-        .ok()?;
-    let s = env.call_method(&text, "toString", "()Ljava/lang/String;", &[]).ok()?.l().ok()?;
-    let s = JString::from(s);
-    let out: String = env.get_string(&s).ok()?.into();
-    // The activity reference belongs to the Android runtime.
-    std::mem::forget(activity);
-    Some(out)
+    result.ok()
+}
+
+/// Text on the Android clipboard (ClipboardManager).
+fn clipboard_text(app: &AndroidApp) -> Option<String> {
+    with_activity(app, |env, activity| {
+        let name = env.new_string("clipboard")?;
+        let manager = env
+            .call_method(activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[(&name).into()])?
+            .l()?;
+        let clip = env.call_method(&manager, "getPrimaryClip", "()Landroid/content/ClipData;", &[])?.l()?;
+        if clip.is_null() {
+            return Ok(None);
+        }
+        let item = env.call_method(&clip, "getItemAt", "(I)Landroid/content/ClipData$Item;", &[0i32.into()])?.l()?;
+        let text = env
+            .call_method(&item, "coerceToText", "(Landroid/content/Context;)Ljava/lang/CharSequence;", &[activity.into()])?
+            .l()?;
+        let s = env.call_method(&text, "toString", "()Ljava/lang/String;", &[])?.l()?;
+        let out: String = env.get_string(&jni::objects::JString::from(s))?.into();
+        Ok(Some(out))
+    })
+    .flatten()
+}
+
+/// Opens a link in the browser (the APK download, which Android then offers to install).
+fn open_url(app: &AndroidApp, url: &str) -> bool {
+    with_activity(app, |env, activity| {
+        let text = env.new_string(url)?;
+        let uri = env
+            .call_static_method("android/net/Uri", "parse", "(Ljava/lang/String;)Landroid/net/Uri;", &[(&text).into()])?
+            .l()?;
+        let action = env.new_string("android.intent.action.VIEW")?;
+        let intent =
+            env.new_object("android/content/Intent", "(Ljava/lang/String;Landroid/net/Uri;)V", &[(&action).into(), (&uri).into()])?;
+        env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[(&intent).into()])?;
+        Ok(())
+    })
+    .is_some()
 }

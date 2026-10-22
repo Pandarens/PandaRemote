@@ -5,6 +5,7 @@ pub mod config;
 pub mod icons;
 pub mod media;
 pub mod proto;
+pub mod release;
 pub mod ticket;
 
 // The host, the desktop window and the Windows integration are not part of the Android viewer.

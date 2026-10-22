@@ -8,40 +8,20 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 
-const REPO: &str = "Pandarens/PandaRemote";
+pub use crate::release::Version;
+use crate::release::http;
+
 /// Public half of the release signing key (the private half is the `PANDA_SIGNING_KEY` CI secret).
 pub const RELEASE_PUBLIC_KEY: &str = "c58f7d00f79c68e436cfff2bea7890057cb6c26042e0f52e8a094f5f6215286b";
 /// How often running copies look for a new release.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const EXE_ASSET: &str = "panda-rc.exe";
 const SIG_ASSET: &str = "panda-rc.exe.sig";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Version(u32, u32, u32);
-
-impl Version {
-    pub fn current() -> Version {
-        Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version is semver")
-    }
-
-    pub fn parse(s: &str) -> Option<Version> {
-        let mut parts = s.trim().trim_start_matches('v').split('.').map(|p| p.parse::<u32>().ok());
-        Some(Version(parts.next()??, parts.next()??, parts.next()??))
-    }
-}
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.0, self.1, self.2)
-    }
-}
 
 pub struct Release {
     pub version: Version,
@@ -82,42 +62,14 @@ pub fn verify(exe: &[u8], version: Version, sig_hex: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("подпись обновления не совпадает — файл отклонён"))
 }
 
-fn http() -> Result<reqwest::Client> {
-    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(reqwest::Client::builder()
-        .tls_backend_preconfigured(tls)
-        .user_agent(concat!("panda-rc/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(300))
-        .build()?)
-}
-
 /// The latest GitHub release, if it is newer than this build.
 pub async fn newer_release() -> Result<Option<Release>> {
-    #[derive(Deserialize)]
-    struct Asset {
-        name: String,
-        browser_download_url: String,
-    }
-    #[derive(Deserialize)]
-    struct GhRelease {
-        tag_name: String,
-        assets: Vec<Asset>,
-    }
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let resp = http()?.get(url).send().await?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None); // no releases yet
-    }
-    let rel: GhRelease = resp.error_for_status()?.json().await?;
-    let version = Version::parse(&rel.tag_name).with_context(|| format!("bad release tag {}", rel.tag_name))?;
+    let Some(rel) = crate::release::latest().await? else { return Ok(None) };
+    let version = rel.version;
     if version <= Version::current() {
         return Ok(None);
     }
-    let asset = |name: &str| rel.assets.iter().find(|a| a.name == name).map(|a| a.browser_download_url.clone());
+    let asset = |name: &str| rel.asset(name).map(str::to_string);
     let (Some(exe_url), Some(sig_url)) = (asset(EXE_ASSET), asset(SIG_ASSET)) else {
         bail!("release {version} has no signed {EXE_ASSET}");
     };

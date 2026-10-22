@@ -26,6 +26,9 @@ tokio = { version = "1.54.0", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 mp4 = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 iroh-mainline-address-lookup = "0.6.1"
 
 # Desktop only: the host, the desktop window and self-update are not part of the Android viewer.
@@ -34,10 +37,7 @@ eframe = "0.37"
 arboard = { version = "3", default-features = false }
 gilrs = "0.11"
 raw-window-handle = "0.6"
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rfd = "0.16"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1"
 xcap = "0.9"
 
 # The Android app brings its own activity glue; accesskit does not work with NativeActivity.
