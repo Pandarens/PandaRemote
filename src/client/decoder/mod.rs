@@ -47,7 +47,8 @@ pub fn supported() -> Vec<Codec> {
     #[cfg(windows)]
     return mf::supported();
     #[cfg(target_os = "android")]
-    return [Codec::H264, Codec::Hevc].into_iter().filter(|&c| c == Codec::H264 || android::has_decoder(c)).collect();
+    // HEVC stays off until the MediaCodec path is confirmed on real phones: it has no software fallback.
+    return vec![Codec::H264];
     #[cfg(not(any(windows, target_os = "android")))]
     vec![Codec::H264]
 }

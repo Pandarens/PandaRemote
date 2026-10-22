@@ -5140,7 +5140,7 @@ dependencies = [
 
 [[package]]
 name = "panda-android"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -5157,7 +5157,7 @@ dependencies = [
 
 [[package]]
 name = "panda-rc"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "ab_glyph",
  "anyhow",

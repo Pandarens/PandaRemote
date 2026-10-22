@@ -300,6 +300,9 @@ fn decode_loop(
         }
     };
     *shared.decoder.lock().unwrap() = decoder.name();
+    // A hardware decoder that takes input but never returns a picture (seen on phones) is replaced by
+    // the software one, so the viewer gets a picture either way.
+    let (mut fed_blind, mut seen_picture, mut on_hw) = (0u32, false, allow_hw && codec == Codec::H264);
     // Until the first keyframe (and after any loss) P-frames would decode into garbage.
     let mut awaiting_key = true;
     let mut last_request: Option<Instant> = None;
@@ -319,16 +322,32 @@ fn decode_loop(
         }
         awaiting_key = false;
         match decoder.decode(&frame.data) {
-            Ok(Some(picture)) => {
+            // An empty picture (a decoder quirk) counts as none.
+            Ok(Some(picture)) if picture.width > 0 && picture.height > 0 => {
+                seen_picture = true;
                 *shared.frame.lock().unwrap() = Some(picture);
                 shared.decoded.fetch_add(1, Ordering::Relaxed);
                 repaint();
             }
-            Ok(None) => {}
+            Ok(_) => fed_blind += 1,
             Err(e) => {
+                fed_blind += 1;
                 tracing::debug!("decode error, requesting keyframe: {e:#}");
                 awaiting_key = true;
                 request_key(&mut last_request);
+            }
+        }
+        if on_hw && !seen_picture && fed_blind >= 60 {
+            on_hw = false;
+            tracing::warn!(decoder = %decoder.name(), "hardware decoder gave no picture, switching to software");
+            match decoder::create(codec, width, height, false) {
+                Ok(d) => {
+                    decoder = d;
+                    *shared.decoder.lock().unwrap() = format!("{} (аппаратный не выдал кадров)", decoder.name());
+                    awaiting_key = true;
+                    request_key(&mut last_request);
+                }
+                Err(e) => tracing::error!("software decoder failed too: {e:#}"),
             }
         }
     }

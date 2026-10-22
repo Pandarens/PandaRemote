@@ -22,7 +22,8 @@ fn mime(codec: Codec) -> &'static str {
     }
 }
 
-/// Whether this phone has a decoder for `codec`.
+/// Whether this phone has a decoder for `codec` (for offering HEVC once the MediaCodec path is confirmed).
+#[allow(dead_code)]
 pub fn has_decoder(codec: Codec) -> bool {
     MediaCodec::from_decoder_type(mime(codec)).is_some()
 }
@@ -127,9 +128,16 @@ impl Drop for MediaDecoder {
 
 /// YUV_420_888 (any plane strides) -> tightly packed NV12 of the visible area.
 fn to_nv12(image: &Image) -> Result<VideoFrame> {
+    // Some decoders leave the crop rectangle empty: then the whole image is the picture.
     let crop = image.crop_rect()?;
-    let (w, h) = (((crop.right - crop.left) as usize) & !1, ((crop.bottom - crop.top) as usize) & !1);
-    let (x0, y0) = (crop.left as usize, crop.top as usize);
+    let (iw, ih) = (image.width()? as usize, image.height()? as usize);
+    let (mut x0, mut y0, mut w, mut h) =
+        (crop.left as usize, crop.top as usize, (crop.right - crop.left) as usize, (crop.bottom - crop.top) as usize);
+    if w == 0 || h == 0 || x0 + w > iw || y0 + h > ih {
+        (x0, y0, w, h) = (0, 0, iw, ih);
+    }
+    let (w, h) = (w & !1, h & !1);
+    anyhow::ensure!(w > 0 && h > 0, "empty image");
     let (yp, ys) = (image.plane_data(0)?, image.plane_row_stride(0)? as usize);
     let (up, us, upx) = (image.plane_data(1)?, image.plane_row_stride(1)? as usize, image.plane_pixel_stride(1)? as usize);
     let (vp, vs, vpx) = (image.plane_data(2)?, image.plane_row_stride(2)? as usize, image.plane_pixel_stride(2)? as usize);

@@ -148,8 +148,13 @@ impl Session {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.label(semibold(&self.name, 15.0));
-                    let short = status.split(" · ").take(3).collect::<Vec<_>>().join(" · ");
+                    let parts: Vec<&str> = status.split(" · ").collect();
+                    let short = parts.iter().take(3).copied().collect::<Vec<_>>().join(" · ");
                     ui.add(egui::Label::new(muted(short).small()).truncate());
+                    // Which decoder is in use: the first thing to know when the picture stays black.
+                    if let Some(dec) = parts.iter().find(|p| p.starts_with("декодер")) {
+                        ui.add(egui::Label::new(muted(*dec).small()).truncate());
+                    }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if button_sized(ui, Some(Icon::ChevronDown), "", Kind::Ghost, 40.0).clicked() {
