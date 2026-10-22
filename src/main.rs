@@ -77,6 +77,9 @@ enum Command {
     ReleaseSign { file: std::path::PathBuf },
     /// Какие кодеки (H.264, HEVC, AV1) этот ПК умеет кодировать и декодировать
     Codecs,
+    /// Сохранить значок программы в PNG (для сборки Android-приложения)
+    #[command(hide = true)]
+    IconPng { out: std::path::PathBuf, size: u32 },
     /// Диагностика: скорость энкодера на синтетических кадрах 1080p
     #[command(hide = true)]
     BenchEncoder {
@@ -246,6 +249,10 @@ fn main() -> Result<()> {
             println!("Пакет пробуждения отправлен через {}", via.host_id.fmt_short());
             Ok(())
         }),
+        Some(Command::IconPng { out, size }) => {
+            std::fs::write(&out, panda_rc::icons::app_icon_png(size)?)?;
+            Ok(())
+        }
         Some(Command::Codecs) => {
             println!("Кодирование (аппаратное, для хоста):");
             for (codec, name) in host::encoder::hardware_codecs() {

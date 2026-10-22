@@ -117,6 +117,16 @@ impl Icon {
     }
 }
 
+/// The app icon as a PNG (for the Android launcher icons).
+pub fn app_icon_png(px: u32) -> anyhow::Result<Vec<u8>> {
+    let rgba = app_icon_rgba(px);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px).ok_or_else(|| anyhow::anyhow!("icon size"))?;
+    for (dst, c) in pixmap.pixels_mut().iter_mut().zip(rgba.chunks_exact(4)) {
+        *dst = resvg::tiny_skia::ColorU8::from_rgba(c[0], c[1], c[2], c[3]).premultiply();
+    }
+    Ok(pixmap.encode_png()?)
+}
+
 /// The app icon (white panda on a dark rounded square), RGBA straight alpha, for the tray.
 pub fn app_icon_rgba(px: u32) -> Vec<u8> {
     use resvg::{tiny_skia, usvg};

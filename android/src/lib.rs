@@ -13,7 +13,7 @@ use std::{
 };
 
 use eframe::egui::{self, Color32};
-use eframe::winit::platform::android::activity::AndroidApp;
+use android_activity::AndroidApp;
 use panda_rc::{
     client::{self, viewer},
     config::{self, SavedHost},
@@ -313,7 +313,7 @@ impl App {
         let Some(p) = self.pin.as_mut() else { return };
         let (mut submit, mut cancel) = (false, false);
         let frame = egui::Frame::new().fill(SURFACE).stroke(egui::Stroke::new(1.0, RAISED_BORDER)).corner_radius(14.0).inner_margin(20.0);
-        egui::Modal::new(egui::Id::new("pin")).frame(frame).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("pin")).frame(frame).show(ctx, |ui| {
             ui.set_width((ctx.content_rect().width() - 64.0).clamp(240.0, 420.0));
             ui.label(semibold("Введите PIN-код", 18.0));
             ui.label(muted(format!("«{}» защищён PIN-кодом", p.name)));

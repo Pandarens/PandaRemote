@@ -8,7 +8,7 @@ use std::{
 };
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, TextureHandle, TextureOptions, Vec2};
-use eframe::winit::platform::android::activity::AndroidApp;
+use android_activity::AndroidApp;
 use panda_rc::{
     client::viewer,
     icons::Icon,
@@ -123,7 +123,7 @@ impl Session {
         });
         if !self.toolbar {
             // A small handle brings the toolbar back.
-            egui::Area::new(egui::Id::new("handle")).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-12.0, 34.0)).show(ui.ctx(), |ui| {
+            egui::Area::new(egui::Id::unique("handle")).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-12.0, 34.0)).show(ui.ctx(), |ui| {
                 if button_sized(ui, Some(Icon::More), "", Kind::Secondary, 40.0).clicked() {
                     self.toolbar = true;
                 }
