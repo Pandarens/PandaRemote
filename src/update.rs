@@ -198,7 +198,7 @@ mod tests {
     fn signature_binds_version_and_bytes() {
         let secret = iroh::SecretKey::generate();
         let hex = data_encoding::HEXLOWER.encode(&secret.to_bytes());
-        let v = Version(1, 2, 3);
+        let v = Version::parse("1.2.3").unwrap();
         let sig = sign(b"exe", v, &hex).unwrap();
         let check = |exe: &[u8], v: Version| {
             let s: [u8; 64] = data_encoding::HEXLOWER.decode(sig.as_bytes()).unwrap().try_into().unwrap();
@@ -206,6 +206,6 @@ mod tests {
         };
         assert!(check(b"exe", v));
         assert!(!check(b"exE", v), "tampered file");
-        assert!(!check(b"exe", Version(1, 2, 4)), "replayed as another version");
+        assert!(!check(b"exe", Version::parse("1.2.4").unwrap()), "replayed as another version");
     }
 }
