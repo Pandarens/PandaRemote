@@ -5140,7 +5140,7 @@ dependencies = [
 
 [[package]]
 name = "panda-android"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -5157,7 +5157,7 @@ dependencies = [
 
 [[package]]
 name = "panda-rc"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -5173,7 +5173,9 @@ dependencies = [
  "humantime",
  "iroh",
  "iroh-mainline-address-lookup",
+ "log",
  "mp4",
+ "ndk",
  "openh264",
  "opus-rs",
  "postcard",

@@ -30,6 +30,8 @@ pub struct Session {
     pub profile: Profile,
     pub shared: Arc<viewer::Shared>,
     out: UnboundedSender<ClientMsg>,
+    /// Kept for the session's lifetime (the viewer sends queued files through it).
+    _files: UnboundedSender<std::path::PathBuf>,
     pub task: JoinHandle<()>,
     texture: Option<TextureHandle>,
     size: Option<(usize, usize)>,
@@ -55,6 +57,7 @@ impl Session {
         profile: Profile,
         shared: Arc<viewer::Shared>,
         out: UnboundedSender<ClientMsg>,
+        files: UnboundedSender<std::path::PathBuf>,
         task: JoinHandle<()>,
     ) -> Self {
         Session {
@@ -63,6 +66,7 @@ impl Session {
             profile,
             shared,
             out,
+            _files: files,
             task,
             texture: None,
             size: None,

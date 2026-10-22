@@ -1,5 +1,7 @@
 //! Video decoders: Media Foundation (DXVA when possible) for H.264/HEVC/AV1 on Windows, openh264 (H.264) as fallback.
 
+#[cfg(target_os = "android")]
+mod android;
 #[cfg(windows)]
 mod mf;
 mod sw;
@@ -26,6 +28,14 @@ pub fn create(codec: Codec, width: u32, height: u32, allow_hw: bool) -> Result<B
             Err(e) => return Err(e),
         }
     }
+    #[cfg(target_os = "android")]
+    if allow_hw || codec != Codec::H264 {
+        match android::MediaDecoder::new(codec, width, height) {
+            Ok(d) => return Ok(Box::new(d)),
+            Err(e) if codec == Codec::H264 => tracing::warn!("MediaCodec unavailable, using openh264: {e:#}"),
+            Err(e) => return Err(e),
+        }
+    }
     anyhow::ensure!(codec == Codec::H264, "no {} decoder", codec.name());
     let _ = (width, height, allow_hw);
     Ok(Box::new(sw::SwDecoder::new()?))
@@ -36,7 +46,9 @@ pub fn create(codec: Codec, width: u32, height: u32, allow_hw: bool) -> Result<B
 pub fn supported() -> Vec<Codec> {
     #[cfg(windows)]
     return mf::supported();
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
+    return [Codec::H264, Codec::Hevc].into_iter().filter(|&c| c == Codec::H264 || android::has_decoder(c)).collect();
+    #[cfg(not(any(windows, target_os = "android")))]
     vec![Codec::H264]
 }
 

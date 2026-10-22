@@ -35,6 +35,11 @@ fn android_main(app: AndroidApp) {
         // SAFETY: set once at startup, before any other thread reads the environment.
         unsafe { std::env::set_var("PANDA_HOME", dir) };
     }
+    // The host's connection journal shows the client by name: use the phone's model.
+    if let Some(model) = device_model(&app) {
+        // SAFETY: as above, before other threads start.
+        unsafe { std::env::set_var("COMPUTERNAME", model) };
+    }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     let options = eframe::NativeOptions { android_app: Some(app.clone()), ..Default::default() };
     let result = eframe::run_native(
@@ -168,7 +173,8 @@ impl App {
         let shared = Arc::new(viewer::Shared::default());
         *shared.status.lock().unwrap() = "Подключение…".into();
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_files_tx, files_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Sending files from the phone is not offered yet; the session keeps the sender anyway.
+        let (files_tx, files_rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = self.ctx.clone();
         let repaint: viewer::Repaint = Arc::new(move || ctx.request_repaint());
         let (tx, ctx2) = (self.tx.clone(), self.ctx.clone());
@@ -188,7 +194,7 @@ impl App {
             ctx2.request_repaint();
         });
         self.message = None;
-        self.session = Some(Session::new(name, ticket_str, profile, shared, out_tx, task));
+        self.session = Some(Session::new(name, ticket_str, profile, shared, out_tx, files_tx, task));
     }
 
     fn handle_events(&mut self) {
@@ -452,6 +458,16 @@ fn clipboard_text(app: &AndroidApp) -> Option<String> {
         Ok(Some(out))
     })
     .flatten()
+}
+
+/// The phone's model name (`Build.MODEL`, e.g. "Pixel 8").
+fn device_model(app: &AndroidApp) -> Option<String> {
+    with_activity(app, |env, _| {
+        let model = env.get_static_field("android/os/Build", "MODEL", "Ljava/lang/String;")?.l()?;
+        let s: String = env.get_string(&jni::objects::JString::from(model))?.into();
+        Ok(s)
+    })
+    .filter(|s| !s.trim().is_empty())
 }
 
 /// Opens a link in the browser (the APK download, which Android then offers to install).

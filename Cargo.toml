@@ -1,6 +1,6 @@
 [package]
 name = "panda-rc"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 
 [dependencies]
@@ -43,6 +43,8 @@ xcap = "0.9"
 # The Android app brings its own activity glue; accesskit does not work with NativeActivity.
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu"] }
+log = "0.4"
+ndk = { version = "0.9", features = ["media", "api-level-26"] }
 
 [target."cfg(windows)".dependencies]
 tiny-skia = "0.12"

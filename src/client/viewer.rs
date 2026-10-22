@@ -245,6 +245,8 @@ pub async fn run(
             }
             repaint();
         }
+        // No more files can come (the sender is gone): that is not the end of the session.
+        std::future::pending::<()>().await;
         anyhow::Ok(())
     };
     let stats = async {
