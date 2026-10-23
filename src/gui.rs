@@ -34,6 +34,14 @@ pub fn run(rt: Runtime, initial: Option<(Ticket, Profile)>, minimized: bool) -> 
             .with_title("Panda Remote")
             .with_inner_size([820.0, 560.0])
             .with_min_inner_size([620.0, 420.0]),
+        // Present frames as soon as they are decoded: waiting for vsync adds up to a frame of delay.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            surface: eframe::egui_wgpu::SurfaceConfig {
+                present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+                desired_maximum_frame_latency: Some(1),
+            },
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(

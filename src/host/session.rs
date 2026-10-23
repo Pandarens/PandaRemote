@@ -6,6 +6,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use std::time::Duration;
+
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::oneshot;
@@ -77,7 +79,7 @@ pub async fn serve(
     proto::write_msg(&mut send, &info).await?;
 
     let input_tx = input::spawn(start.place);
-    let mut abr = Abr { current: start_bitrate, min: min_bitrate, max: max_bitrate, clean_seconds: 0 };
+    let mut abr = Abr { current: start_bitrate, min: min_bitrate, max: max_bitrate, clean_seconds: 0, base_rtt: None };
 
     // Messages to the viewer from other tasks (clipboard, received files) go out through the notify loop.
     let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel::<HostMsg>();
@@ -147,8 +149,9 @@ pub async fn serve(
                     }
                 }
                 ClientMsg::Stats { frames, lost } => {
-                    if let Some(bps) = abr.update(frames, lost) {
-                        tracing::debug!(bps, frames, lost, "bitrate changed");
+                    let rtt = conn.paths().iter().map(|p| p.rtt()).min();
+                    if let Some(bps) = abr.update(frames, lost, rtt) {
+                        tracing::debug!(bps, frames, lost, ?rtt, "bitrate changed");
                         control.bitrate.store(bps, Ordering::Relaxed);
                     }
                 }
@@ -222,22 +225,37 @@ fn on_secure_desktop() -> bool {
     false
 }
 
-/// Adaptive bitrate: back off on loss, probe upwards after a clean stretch.
+/// Adaptive bitrate: back off on loss or on a growing round trip (packets queuing somewhere on the path
+/// long before any are dropped), probe upwards after a clean stretch.
 struct Abr {
     current: u32,
     min: u32,
     max: u32,
     clean_seconds: u32,
+    /// Lowest round trip seen: the path's delay without queuing.
+    base_rtt: Option<Duration>,
 }
 
+/// Round-trip growth over the base that counts as queuing.
+const QUEUE_DELAY: Duration = Duration::from_millis(40);
+
 impl Abr {
-    fn update(&mut self, frames: u32, lost: u32) -> Option<u32> {
+    fn update(&mut self, frames: u32, lost: u32, rtt: Option<Duration>) -> Option<u32> {
         let total = frames + lost;
         if total == 0 {
             return None;
         }
         let before = self.current;
-        if lost as f32 / total as f32 > 0.02 {
+        let queuing = rtt.is_some_and(|r| self.base_rtt.is_some_and(|base| r > base + QUEUE_DELAY));
+        // The base follows the lowest round trip, and drifts up 1 ms a second so a slower route after a
+        // network change is not taken for queuing forever.
+        if let Some(r) = rtt {
+            self.base_rtt = Some(self.base_rtt.map_or(r, |base| (base + Duration::from_millis(1)).min(r)));
+        }
+        if queuing {
+            self.current = ((self.current as f32 * 0.85) as u32).max(self.min);
+            self.clean_seconds = 0;
+        } else if lost as f32 / total as f32 > 0.02 {
             self.current = ((self.current as f32 * 0.8) as u32).max(self.min);
             self.clean_seconds = 0;
         } else {
@@ -262,15 +280,26 @@ mod tests {
 
     #[test]
     fn abr_backs_off_and_recovers() {
-        let mut abr = Abr { current: 20_000_000, min: 5_000_000, max: 50_000_000, clean_seconds: 0 };
-        assert_eq!(abr.update(50, 10), Some(16_000_000));
+        let mut abr = Abr { current: 20_000_000, min: 5_000_000, max: 50_000_000, clean_seconds: 0, base_rtt: None };
+        assert_eq!(abr.update(50, 10, None), Some(16_000_000));
         for _ in 0..4 {
-            assert_eq!(abr.update(60, 0), None);
+            assert_eq!(abr.update(60, 0, None), None);
         }
-        assert_eq!(abr.update(60, 0), Some(17_600_000));
+        assert_eq!(abr.update(60, 0, None), Some(17_600_000));
         for _ in 0..20 {
-            abr.update(1, 9);
+            abr.update(1, 9, None);
         }
         assert_eq!(abr.current, 5_000_000);
+    }
+
+    #[test]
+    fn abr_backs_off_when_the_round_trip_grows() {
+        let ms = Duration::from_millis;
+        let mut abr = Abr { current: 20_000_000, min: 5_000_000, max: 50_000_000, clean_seconds: 0, base_rtt: None };
+        assert_eq!(abr.update(60, 0, Some(ms(20))), None);
+        // No loss, but 80 ms more round trip: a queue is building up.
+        assert_eq!(abr.update(60, 0, Some(ms(100))), Some(17_000_000));
+        // Back to normal: no further cut.
+        assert_eq!(abr.update(60, 0, Some(ms(22))), None);
     }
 }

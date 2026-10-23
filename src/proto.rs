@@ -61,7 +61,7 @@ pub enum Profile {
 impl Profile {
     pub fn fps(self) -> u32 {
         match self {
-            Profile::Desktop | Profile::Control => 30,
+            Profile::Desktop | Profile::Control => 60,
             Profile::Game => 60,
         }
     }
@@ -290,7 +290,9 @@ pub mod buttons {
 pub async fn bind_endpoint(key: SecretKey, relay: Option<&str>) -> Result<Endpoint> {
     let transport = QuicTransportConfig::builder()
         .datagram_receive_buffer_size(Some(8 * 1024 * 1024))
-        .datagram_send_buffer_size(8 * 1024 * 1024)
+        // Small on purpose: when the path is slower than the stream, old frames are dropped here (FEC and
+        // keyframe requests cover that) instead of waiting in a queue and arriving late.
+        .datagram_send_buffer_size(1024 * 1024)
         .build();
     let dht_only = std::env::var("PANDA_LOOKUP").is_ok_and(|v| v == "dht");
     let mut builder = if dht_only {

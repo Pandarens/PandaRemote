@@ -68,6 +68,8 @@ pub struct Shared {
     /// Active recording.
     pub recorder: Mutex<Option<super::record::Recorder>>,
     pub decoded: AtomicU32,
+    /// Decode time of the last second, microseconds per frame.
+    pub decode_us: AtomicU32,
     assembled: AtomicU32,
     lost: AtomicU32,
     audio_packets: AtomicU32,
@@ -261,8 +263,9 @@ pub async fn run(
             let _ = out_tx.send(ClientMsg::Stats { frames, lost });
             let loss = if frames + lost > 0 { lost * 100 / (frames + lost) } else { 0 };
             *shared.status.lock().unwrap() = format!(
-                "{} · {decoded} к/с · потери {loss}%{audio} · кодер: {encoder} · декодер: {}",
+                "{} · {decoded} к/с · потери {loss}%{audio} · декодирование {:.1} мс · кодер: {encoder} · декодер: {}",
                 super::path_summary(&conn),
+                shared.decode_us.load(Ordering::Relaxed) as f32 / 1000.0,
                 shared.decoder.lock().unwrap()
             );
             repaint();
@@ -321,7 +324,13 @@ fn decode_loop(
             continue;
         }
         awaiting_key = false;
-        match decoder.decode(&frame.data) {
+        let decode_started = Instant::now();
+        let result = decoder.decode(&frame.data);
+        let us = decode_started.elapsed().as_micros() as u32;
+        // Smoothed, so the status line is readable.
+        let prev = shared.decode_us.load(Ordering::Relaxed);
+        shared.decode_us.store(if prev == 0 { us } else { (prev * 7 + us) / 8 }, Ordering::Relaxed);
+        match result {
             // An empty picture (a decoder quirk) counts as none.
             Ok(Some(picture)) if picture.width > 0 && picture.height > 0 => {
                 seen_picture = true;

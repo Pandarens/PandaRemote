@@ -41,7 +41,18 @@ fn android_main(app: AndroidApp) {
         unsafe { std::env::set_var("COMPUTERNAME", model) };
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    let options = eframe::NativeOptions { android_app: Some(app.clone()), ..Default::default() };
+    let options = eframe::NativeOptions {
+        android_app: Some(app.clone()),
+        // Show each frame as soon as it is decoded, without waiting for vsync.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            surface: eframe::egui_wgpu::SurfaceConfig {
+                present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+                desired_maximum_frame_latency: Some(1),
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let result = eframe::run_native(
         "Panda Remote",
         options,
