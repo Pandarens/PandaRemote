@@ -44,7 +44,8 @@ const NO_SESSION: u32 = 0xFFFF_FFFF;
 
 // ---------- install / uninstall (run elevated) ----------
 
-pub fn install() -> Result<()> {
+/// `user_dir`: the folder of the user installing (named by the app: an elevated process may be another account).
+pub fn install(user_dir: &std::path::Path) -> Result<()> {
     // Check for admin rights first, so a failed attempt leaves nothing behind.
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -62,7 +63,7 @@ pub fn install() -> Result<()> {
     if let Some(service) = &existing {
         stop_and_wait(service)?;
     }
-    let result = deploy(&manager, existing.as_ref());
+    let result = deploy(&manager, existing.as_ref(), user_dir);
     if result.is_err()
         && let Some(service) = &existing
     {
@@ -73,7 +74,11 @@ pub fn install() -> Result<()> {
 }
 
 /// Locks down the data directory, copies the program and host files, then registers and starts the service.
-fn deploy(manager: &ServiceManager, existing: Option<&windows_service::service::Service>) -> Result<()> {
+fn deploy(
+    manager: &ServiceManager,
+    existing: Option<&windows_service::service::Service>,
+    user_dir: &std::path::Path,
+) -> Result<()> {
     // The service runs as SYSTEM with whatever key and secret it finds here, so the directory must not be
     // writable (or pre-seeded) by ordinary users: take ownership, drop inherited rights, and allow only
     // SYSTEM and Administrators. Then always copy this user's files over (existing tickets keep working).
@@ -100,11 +105,11 @@ fn deploy(manager: &ServiceManager, existing: Option<&windows_service::service::
     )?;
     // The service runs its own copy, so the original can be rebuilt or moved while it runs.
     let exe = install_binary()?;
-    let from = config::user_dir();
+    // The service's identity is its key: once it exists, never replace or remove it (every ticket handed out
+    // depends on it). The user's files only seed a first install, so the ticket they already use stays valid.
     for name in config::HOST_FILES {
-        let (src, dst) = (from.join(name), to.join(name));
-        let _ = std::fs::remove_file(&dst);
-        if src.exists() {
+        let (src, dst) = (user_dir.join(name), to.join(name));
+        if !dst.exists() && src.exists() {
             std::fs::copy(&src, &dst).with_context(|| format!("copy {name}"))?;
         }
     }
@@ -141,6 +146,16 @@ fn deploy(manager: &ServiceManager, existing: Option<&windows_service::service::
     };
     let _ = service.set_description("Удалённый доступ Panda Remote: экран блокировки, UAC, работа до входа в систему");
     service.start::<&str>(&[]).context("служба создана, но не запустилась")?;
+    // The service creates its key on first start if it had none; give the user's app the same files.
+    for _ in 0..50 {
+        if to.join("host.key").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if let Err(e) = sync_user_copy(user_dir) {
+        tracing::warn!("could not refresh the user's copy of the ticket: {e:#}");
+    }
     Ok(())
 }
 
@@ -305,6 +320,20 @@ pub fn sync_user_copy(to: &std::path::Path) -> Result<()> {
 pub fn create_view_ticket(to: &std::path::Path) -> Result<()> {
     config::HostConfig::load_or_create()?.ensure_view_secret()?;
     sync_user_copy(to)
+}
+
+/// Puts the host files from `from` (a user's copy) back into the service and restarts it: brings back an
+/// identity the service lost, so the tickets handed out with it work again.
+pub fn restore_identity(from: &std::path::Path) -> Result<()> {
+    let to = config::machine_dir();
+    anyhow::ensure!(from.join("host.key").exists(), "в {} нет host.key", from.display());
+    for name in config::HOST_FILES {
+        if from.join(name).exists() {
+            std::fs::copy(from.join(name), to.join(name)).with_context(|| format!("copy {name}"))?;
+        }
+    }
+    tracing::warn!(from = %from.display(), "host identity restored from the user's copy");
+    restart()
 }
 
 /// Sets the service's PIN from `pin_file` (empty: no PIN), deletes the file and refreshes the copy in `to`.

@@ -1350,7 +1350,7 @@ impl App {
                 self.stop_host();
             }
             let action = match op {
-                ServiceOp::Install => "install".to_string(),
+                ServiceOp::Install => format!("install --user-dir \"{}\"", config::user_dir().display()),
                 ServiceOp::Uninstall => "uninstall".to_string(),
                 ServiceOp::SyncTicket => format!("sync-ticket --to \"{}\"", config::user_dir().display()),
                 ServiceOp::ViewTicket => format!("view-ticket --to \"{}\"", config::user_dir().display()),

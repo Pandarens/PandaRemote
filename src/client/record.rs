@@ -57,7 +57,6 @@ impl Recorder {
         Ok(Recorder { path, kind, started: None })
     }
 
-
     /// Adds one access unit (Annex B). Frames before the first keyframe are skipped.
     pub fn push(&mut self, au: &[u8], keyframe: bool) -> Result<()> {
         if self.started.is_none() {

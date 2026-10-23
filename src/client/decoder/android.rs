@@ -38,7 +38,8 @@ pub struct MediaDecoder {
 impl MediaDecoder {
     pub fn new(codec: Codec, width: u32, height: u32) -> Result<Self> {
         let mc = MediaCodec::from_decoder_type(mime(codec)).with_context(|| format!("no {} decoder", codec.name()))?;
-        let reader = ImageReader::new(width as i32, height as i32, ImageFormat::YUV_420_888, 4).context("ImageReader")?;
+        let reader =
+            ImageReader::new(width as i32, height as i32, ImageFormat::YUV_420_888, 4).context("ImageReader")?;
         let window = reader.window().context("ImageReader window")?;
         let mut format = MediaFormat::new();
         format.set_str("mime", mime(codec));
@@ -139,8 +140,10 @@ fn to_nv12(image: &Image) -> Result<VideoFrame> {
     let (w, h) = (w & !1, h & !1);
     anyhow::ensure!(w > 0 && h > 0, "empty image");
     let (yp, ys) = (image.plane_data(0)?, image.plane_row_stride(0)? as usize);
-    let (up, us, upx) = (image.plane_data(1)?, image.plane_row_stride(1)? as usize, image.plane_pixel_stride(1)? as usize);
-    let (vp, vs, vpx) = (image.plane_data(2)?, image.plane_row_stride(2)? as usize, image.plane_pixel_stride(2)? as usize);
+    let (up, us, upx) =
+        (image.plane_data(1)?, image.plane_row_stride(1)? as usize, image.plane_pixel_stride(1)? as usize);
+    let (vp, vs, vpx) =
+        (image.plane_data(2)?, image.plane_row_stride(2)? as usize, image.plane_pixel_stride(2)? as usize);
     let mut y = vec![0u8; w * h];
     for row in 0..h {
         let src = (y0 + row) * ys + x0;

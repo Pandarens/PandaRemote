@@ -139,6 +139,16 @@ enum ServiceAction {
         /// Куда записать результат (используется кнопкой в GUI)
         #[arg(long, hide = true)]
         result_file: Option<std::path::PathBuf>,
+        /// Папка пользователя (билет для первой установки и копия билета после); по умолчанию — своя
+        #[arg(long, hide = true)]
+        user_dir: Option<std::path::PathBuf>,
+    },
+    /// Вернуть службе ключ и билет из папки пользователя (если служба потеряла свой ключ)
+    RestoreTicket {
+        #[arg(long)]
+        from: Option<std::path::PathBuf>,
+        #[arg(long, hide = true)]
+        result_file: Option<std::path::PathBuf>,
     },
     /// Остановить и удалить службу (от имени администратора)
     Uninstall {
@@ -354,9 +364,18 @@ fn main() -> Result<()> {
         }
         #[cfg(windows)]
         Some(Command::Service { action }) => match action {
-            ServiceAction::Install { result_file } => service::report(result_file, service::install(), || {
-                println!("Служба установлена и запущена. Билет прежний: panda-rc ticket")
-            }),
+            ServiceAction::RestoreTicket { from, result_file } => {
+                let from = from.unwrap_or_else(config::user_dir);
+                service::report(result_file, service::restore_identity(&from), || {
+                    println!("Служба снова работает с билетом из {}", from.display())
+                })
+            }
+            ServiceAction::Install { result_file, user_dir } => {
+                let user_dir = user_dir.unwrap_or_else(config::user_dir);
+                service::report(result_file, service::install(&user_dir), || {
+                    println!("Служба установлена и запущена. Билет прежний: panda-rc ticket")
+                })
+            }
             ServiceAction::Uninstall { result_file } => {
                 service::report(result_file, service::uninstall(), || println!("Служба удалена."))
             }

@@ -93,6 +93,8 @@ fn load_or_create_key(p: PathBuf) -> Result<SecretKey> {
     }
     let key = SecretKey::generate();
     fs::write(&p, key.to_bytes())?;
+    // A new key is a new address: tickets made for an earlier key stop working. Make that visible.
+    tracing::warn!(path = %p.display(), id = %key.public(), "created a new key");
     Ok(key)
 }
 
@@ -143,8 +145,13 @@ impl HostConfig {
         if let Some(cfg) = Self::load()? {
             return Ok(cfg);
         }
-        let cfg =
-            HostConfig { name: machine_name(), access_secret: random_bytes(), pin: None, view_secret: None, relay: None };
+        let cfg = HostConfig {
+            name: machine_name(),
+            access_secret: random_bytes(),
+            pin: None,
+            view_secret: None,
+            relay: None,
+        };
         cfg.save()?;
         Ok(cfg)
     }
